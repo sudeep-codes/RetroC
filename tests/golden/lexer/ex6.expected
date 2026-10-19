@@ -1,0 +1,13 @@
+1:1 let
+1:5 IDENT("a")
+1:7 =
+1:9 IDENT("map")
+1:12 (
+1:13 IDENT("missing")
+1:20 ,
+1:22 IDENT("x")
+1:24 =>
+1:27 IDENT("x")
+1:28 )
+1:29 ;
+2:1 EOF
