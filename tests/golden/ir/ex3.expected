@@ -1,0 +1,5 @@
+n0 INPUT  users : [{uid:int,name:string}]
+n1 INPUT  orders: [{oid:int,uid:int,amt:int}]
+n2 JOIN   joined: [{left:{uid:int,name:string},right:{oid:int,uid:int,amt:int}}] <- n0,n1  ka: u => u.uid  kb: o => o.uid
+n3 MAP    amts  : [int] <- n2  fn: j => j.right.amt
+n4 OUTPUT amts  : [int] <- n3

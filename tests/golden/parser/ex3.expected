@@ -1,0 +1,60 @@
+Program
+  InputDecl users: [{uid: int, name: string}] =
+    ArrayLit
+      RecordLit
+        Field(uid):
+          IntLit(1)
+        Field(name):
+          StringLit("ana")
+      RecordLit
+        Field(uid):
+          IntLit(2)
+        Field(name):
+          StringLit("bo")
+  InputDecl orders: [{oid: int, uid: int, amt: int}] =
+    ArrayLit
+      RecordLit
+        Field(oid):
+          IntLit(10)
+        Field(uid):
+          IntLit(1)
+        Field(amt):
+          IntLit(5)
+      RecordLit
+        Field(oid):
+          IntLit(11)
+        Field(uid):
+          IntLit(1)
+        Field(amt):
+          IntLit(7)
+      RecordLit
+        Field(oid):
+          IntLit(12)
+        Field(uid):
+          IntLit(2)
+        Field(amt):
+          IntLit(3)
+  LetDecl joined =
+    Call
+      Callee:
+        Ident(join)
+      Args:
+        Ident(users)
+        Ident(orders)
+        Lambda(u)
+          FieldAccess(.uid)
+            Ident(u)
+        Lambda(o)
+          FieldAccess(.uid)
+            Ident(o)
+  LetDecl amts =
+    Call
+      Callee:
+        Ident(map)
+      Args:
+        Ident(joined)
+        Lambda(j)
+          FieldAccess(.amt)
+            FieldAccess(.right)
+              Ident(j)
+  OutputDecl amts

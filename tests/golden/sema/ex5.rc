@@ -1,0 +1,2 @@
+input xs: [int] = [1, 2];
+let a = map(xs, x => x + 1.0);

@@ -1,0 +1,1 @@
+2:24: E301: '+' operands must both be int, float, or string; got int and float

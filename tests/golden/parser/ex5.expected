@@ -1,0 +1,15 @@
+Program
+  InputDecl xs: [int] =
+    ArrayLit
+      IntLit(1)
+      IntLit(2)
+  LetDecl a =
+    Call
+      Callee:
+        Ident(map)
+      Args:
+        Ident(xs)
+        Lambda(x)
+          Binary(+)
+            Ident(x)
+            FloatLit(1.0)

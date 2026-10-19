@@ -1,0 +1,38 @@
+Program
+  FnDecl clamp01(x: float) -> float =
+    If
+      Cond:
+        Binary(<)
+          Ident(x)
+          FloatLit(0.0)
+      Then:
+        FloatLit(0.0)
+      Else:
+        If
+          Cond:
+            Binary(>)
+              Ident(x)
+              FloatLit(1.0)
+          Then:
+            FloatLit(1.0)
+          Else:
+            Ident(x)
+  InputDecl xs: [float] =
+    ArrayLit
+      Unary(-)
+        FloatLit(0.5)
+      FloatLit(0.25)
+      FloatLit(1.5)
+  LetDecl ys =
+    Call
+      Callee:
+        Ident(map)
+      Args:
+        Ident(xs)
+        Lambda(x)
+          Call
+            Callee:
+              Ident(clamp01)
+            Args:
+              Ident(x)
+  OutputDecl ys

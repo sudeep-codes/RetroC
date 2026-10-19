@@ -1,0 +1,7 @@
+input users: [{ uid: int, name: string }] = [{ uid: 1, name: "ana" }, { uid: 2, name: "bo" }];
+input orders: [{ oid: int, uid: int, amt: int }] = [
+  { oid: 10, uid: 1, amt: 5 }, { oid: 11, uid: 1, amt: 7 }, { oid: 12, uid: 2, amt: 3 }
+];
+let joined = join(users, orders, u => u.uid, o => o.uid);
+let amts = map(joined, j => j.right.amt);
+output amts;

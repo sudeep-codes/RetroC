@@ -1,0 +1,10 @@
+input rows: [{ id: int, v: float, ok: bool }] = [
+  { id: 1, v: 2.0, ok: true },
+  { id: 2, v: 5.0, ok: false },
+  { id: 3, v: 4.0, ok: true }
+];
+let clean = filter(rows, r => r.ok);
+let vals = map(clean, r => r.v);
+let sum = reduce(vals, 0.0, (a, x) => a + x);
+let avg = sum / to_float(length(vals));
+output avg;

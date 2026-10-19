@@ -1,0 +1,6 @@
+n0 INPUT  rows  : [{id:int,v:float,ok:bool}]
+n1 FILTER clean : [{id:int,v:float,ok:bool}] <- n0  fn: r => r.ok
+n2 MAP    vals  : [float] <- n1  fn: r => r.v
+n3 REDUCE sum   : float <- n2  init: 0.0  fn: (a, x) => a + x
+n4 SCALAR avg   : float <- n3,n2  expr: sum / to_float(length(vals))
+n5 OUTPUT avg   : float <- n4

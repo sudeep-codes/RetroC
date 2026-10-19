@@ -1,0 +1,66 @@
+Program
+  InputDecl rows: [{id: int, v: float, ok: bool}] =
+    ArrayLit
+      RecordLit
+        Field(id):
+          IntLit(1)
+        Field(v):
+          FloatLit(2.0)
+        Field(ok):
+          BoolLit(true)
+      RecordLit
+        Field(id):
+          IntLit(2)
+        Field(v):
+          FloatLit(5.0)
+        Field(ok):
+          BoolLit(false)
+      RecordLit
+        Field(id):
+          IntLit(3)
+        Field(v):
+          FloatLit(4.0)
+        Field(ok):
+          BoolLit(true)
+  LetDecl clean =
+    Call
+      Callee:
+        Ident(filter)
+      Args:
+        Ident(rows)
+        Lambda(r)
+          FieldAccess(.ok)
+            Ident(r)
+  LetDecl vals =
+    Call
+      Callee:
+        Ident(map)
+      Args:
+        Ident(clean)
+        Lambda(r)
+          FieldAccess(.v)
+            Ident(r)
+  LetDecl sum =
+    Call
+      Callee:
+        Ident(reduce)
+      Args:
+        Ident(vals)
+        FloatLit(0.0)
+        Lambda(a, x)
+          Binary(+)
+            Ident(a)
+            Ident(x)
+  LetDecl avg =
+    Binary(/)
+      Ident(sum)
+      Call
+        Callee:
+          Ident(to_float)
+        Args:
+          Call
+            Callee:
+              Ident(length)
+            Args:
+              Ident(vals)
+  OutputDecl avg

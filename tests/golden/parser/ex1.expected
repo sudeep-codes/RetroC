@@ -1,0 +1,44 @@
+Program
+  InputDecl xs: [int] =
+    ArrayLit
+      IntLit(1)
+      IntLit(2)
+      IntLit(3)
+      IntLit(4)
+      IntLit(5)
+      IntLit(6)
+  LetDecl evens =
+    Call
+      Callee:
+        Ident(filter)
+      Args:
+        Ident(xs)
+        Lambda(x)
+          Binary(==)
+            Binary(%)
+              Ident(x)
+              IntLit(2)
+            IntLit(0)
+  LetDecl sq =
+    Call
+      Callee:
+        Ident(map)
+      Args:
+        Ident(evens)
+        Lambda(x)
+          Binary(*)
+            Ident(x)
+            Ident(x)
+  LetDecl total =
+    Call
+      Callee:
+        Ident(reduce)
+      Args:
+        Ident(sq)
+        IntLit(0)
+        Lambda(a, x)
+          Binary(+)
+            Ident(a)
+            Ident(x)
+  OutputDecl sq
+  OutputDecl total

@@ -1,0 +1,9 @@
+Program
+  FnDecl f(x: int) -> int =
+    Call
+      Callee:
+        Ident(f)
+      Args:
+        Binary(-)
+          Ident(x)
+          IntLit(1)

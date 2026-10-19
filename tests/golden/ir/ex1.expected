@@ -1,0 +1,6 @@
+n0 INPUT  xs    : [int]
+n1 FILTER evens : [int] <- n0  fn: x => x % 2 == 0
+n2 MAP    sq    : [int] <- n1  fn: x => x * x
+n3 REDUCE total : int <- n2  init: 0  fn: (a, x) => a + x
+n4 OUTPUT sq    : [int] <- n2
+n5 OUTPUT total : int <- n3

@@ -1,0 +1,9 @@
+Program
+  LetDecl a =
+    Call
+      Callee:
+        Ident(map)
+      Args:
+        Ident(missing)
+        Lambda(x)
+          Ident(x)
