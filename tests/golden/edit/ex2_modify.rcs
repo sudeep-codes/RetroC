@@ -1,0 +1,2 @@
+// Modify row 1 ok = true
+retro modify rows[1].ok = true

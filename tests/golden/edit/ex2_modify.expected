@@ -1,0 +1,9 @@
+Edit #1: retro modify rows[1].ok = true
+Plan:
+  clean      PARTIAL  evaluated      1 / 3       reused 2
+  vals       PARTIAL  evaluated      1 / 3       reused 2  (early cutoff on unchanged inputs)
+  sum        FULL     evaluated      3 / 3       (reduce is O(n) in v1)
+  avg        FULL     evaluated      1 / 1     
+Recomputed: 6 ops   Reused: 4 ops   Full-rerun cost: 10 ops
+Reuse: 40.0%   Updated outputs: avg
+avg = 3.6666666666666665

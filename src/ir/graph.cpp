@@ -43,4 +43,48 @@ void Graph::assert_invariants() const {
     }
 }
 
+bool Graph::recompute_topological_order() {
+    // Kahn's algorithm or DFS topological sort
+    // In-degree for each node = number of its inputs
+    std::unordered_map<NodeId, size_t> in_degree;
+    std::unordered_map<NodeId, std::vector<NodeId>> adj; // u -> [v] where u is an input to v
+
+    for (const auto& [id, node] : nodes) {
+        in_degree[id] = node.inputs.size();
+        for (const auto& in_id : node.inputs) {
+            adj[in_id].push_back(id);
+        }
+    }
+
+    // Queue of nodes with in_degree == 0, preserving stable original order if possible
+    std::vector<NodeId> zero_in;
+    for (const auto& [id, deg] : in_degree) {
+        if (deg == 0) {
+            zero_in.push_back(id);
+        }
+    }
+
+    std::vector<NodeId> new_order;
+    new_order.reserve(nodes.size());
+
+    size_t head = 0;
+    while (head < zero_in.size()) {
+        NodeId u = zero_in[head++];
+        new_order.push_back(u);
+
+        for (const auto& v : adj[u]) {
+            if (--in_degree[v] == 0) {
+                zero_in.push_back(v);
+            }
+        }
+    }
+
+    if (new_order.size() != nodes.size()) {
+        return false; // Cycle detected
+    }
+
+    order = std::move(new_order);
+    return true;
+}
+
 } // namespace retroc

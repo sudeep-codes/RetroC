@@ -31,8 +31,28 @@ struct Graph {
         return nullptr;
     }
 
+    Node* find_node_by_name(const std::string& name) {
+        for (auto& [id, n] : nodes) {
+            if (n.name == name) return &n;
+        }
+        return nullptr;
+    }
+
     // Assert graph invariants (I1: DAG and topological order, I2: unique NodeIds)
     void assert_invariants() const;
+
+    // Recompute topological order (I1)
+    bool recompute_topological_order();
+
+    Graph clone() const {
+        Graph g;
+        for (const auto& [id, node] : nodes) {
+            g.nodes.emplace(id, node.clone());
+        }
+        g.order = order;
+        g.outputs = outputs;
+        return g;
+    }
 };
 
 } // namespace retroc

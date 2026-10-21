@@ -64,7 +64,7 @@ void SemanticAnalyzer::check_input_decl(InputDecl* decl) {
     }
 
     if (decl->init_expr) {
-        TypePtr expr_type = check_expr(decl->init_expr.get());
+        TypePtr expr_type = check_expr(decl->init_expr.get(), decl->type);
         if (!types_equal(decl->type, expr_type)) {
             throw SemaException{error(ErrorCode::E301, decl->init_expr->loc,
                 "type mismatch in input '" + decl->name + "': declared " + decl->type->to_string() + ", got " + expr_type->to_string())};
@@ -149,7 +149,7 @@ void SemanticAnalyzer::check_output_decl(OutputDecl* decl) {
     }
 }
 
-TypePtr SemanticAnalyzer::check_expr(Expr* expr, const TypePtr& expected_lambda_sig) {
+TypePtr SemanticAnalyzer::check_expr(Expr* expr, const TypePtr& expected_type) {
     if (!expr) return nullptr;
 
     TypePtr result = nullptr;
@@ -193,6 +193,10 @@ TypePtr SemanticAnalyzer::check_expr(Expr* expr, const TypePtr& expected_lambda_
         case ExprKind::ARRAY_LIT: {
             auto* e = static_cast<ArrayLitExpr*>(expr);
             if (e->elements.empty()) {
+                if (expected_type && expected_type->kind == TypeKind::ARRAY) {
+                    result = expected_type;
+                    break;
+                }
                 // Empty array requires context or type
                 throw SemaException{error(ErrorCode::E301, expr->loc, "cannot infer element type of empty array literal")};
             }
@@ -360,7 +364,7 @@ TypePtr SemanticAnalyzer::check_expr(Expr* expr, const TypePtr& expected_lambda_
             break;
         }
         case ExprKind::LAMBDA: {
-            result = check_lambda(static_cast<LambdaExpr*>(expr), expected_lambda_sig);
+            result = check_lambda(static_cast<LambdaExpr*>(expr), expected_type);
             break;
         }
     }

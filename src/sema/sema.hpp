@@ -49,7 +49,7 @@ private:
     void check_let_decl(LetDecl* decl);
     void check_output_decl(OutputDecl* decl);
 
-    TypePtr check_expr(Expr* expr, const TypePtr& expected_lambda_sig = nullptr);
+    TypePtr check_expr(Expr* expr, const TypePtr& expected_type = nullptr);
     TypePtr check_lambda(LambdaExpr* expr, const TypePtr& expected_lambda_sig);
     TypePtr check_call(CallExpr* expr);
     TypePtr check_builtin_call(CallExpr* expr, const std::string& builtin_name);
