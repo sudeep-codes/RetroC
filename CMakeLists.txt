@@ -156,4 +156,15 @@ add_test(NAME diff_tests
     COMMAND difftest --trials 1000 --seed 1
 )
 
+# Benchmark executables
+add_executable(gen_workload
+    bench/gen_workload.cpp
+)
+
+add_executable(bench_runner
+    bench/runner.cpp
+)
+target_link_libraries(bench_runner PRIVATE rc_verify)
+
+
 

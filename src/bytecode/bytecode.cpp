@@ -297,13 +297,49 @@ void BytecodeCompiler::compile_expr(const ExprIR* expr) {
     }
 }
 
+namespace {
+struct FixedVMStack {
+    Value buf[64];
+    size_t sz = 0;
+
+    void push_back(Value v) {
+        if (sz < 64) {
+            buf[sz++] = std::move(v);
+        } else {
+            throw RuntimeError("VM stack overflow");
+        }
+    }
+
+    void pop_back() {
+        if (sz > 0) --sz;
+    }
+
+    Value& back() {
+        return buf[sz - 1];
+    }
+
+    const Value& back() const {
+        return buf[sz - 1];
+    }
+
+    bool empty() const {
+        return sz == 0;
+    }
+
+    size_t size() const {
+        return sz;
+    }
+};
+}
+
 Value VM::execute(
     const BytecodeProgram& prog,
-    const std::vector<Value>& params,
+    const Value* params,
+    size_t num_params,
     const std::unordered_map<std::string, Value>& stage_env
 ) {
-    std::vector<Value> stack;
-    stack.reserve(32);
+    (void)num_params;
+    FixedVMStack stack;
 
     int32_t ip = 0;
     const int32_t n = static_cast<int32_t>(prog.code.size());
@@ -635,7 +671,8 @@ Value VM::execute(
 
             case Opcode::BUILTIN_LENGTH_ARRAY: {
                 Value arr = std::move(stack.back()); stack.pop_back();
-                stack.push_back(Value::make_int(static_cast<int64_t>(arr.array_val.size())));
+                int64_t sz = (arr.int_val != 0) ? arr.int_val : static_cast<int64_t>(arr.array_val.size());
+                stack.push_back(Value::make_int(sz));
                 break;
             }
         }

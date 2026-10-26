@@ -54,6 +54,21 @@ std::vector<std::pair<std::string, std::string>> GraphExecutor::get_outputs() co
     return outputs_;
 }
 
+std::vector<std::pair<std::string, Value>> GraphExecutor::get_output_values() const {
+    std::vector<std::pair<std::string, Value>> out_vals;
+    out_vals.reserve(graph_.outputs.size());
+    for (const auto& out_id : graph_.outputs) {
+        const auto* n = graph_.get_node(out_id);
+        if (n) {
+            auto it = results_.find(out_id);
+            if (it != results_.end()) {
+                out_vals.push_back({n->name, it->second.as_value()});
+            }
+        }
+    }
+    return out_vals;
+}
+
 void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
     NodeExecutionResult res;
     entry.nodes_touched.push_back(node.name);

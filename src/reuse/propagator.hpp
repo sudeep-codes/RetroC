@@ -42,8 +42,8 @@ struct RebuildPlan {
 
 class Propagator {
 public:
-    explicit Propagator(Graph& graph, GraphExecutor& executor)
-        : graph_(graph), executor_(executor) {}
+    explicit Propagator(Graph& graph, GraphExecutor& executor, bool stage_invalidation = false)
+        : graph_(graph), executor_(executor), stage_invalidation_(stage_invalidation) {}
 
     // Apply a single modify edit atomically
     std::variant<RebuildPlan, CompileError> apply_modify(const ModifyEdit& edit);
@@ -56,9 +56,24 @@ public:
     // retro delete <stage>
     std::variant<RebuildPlan, CompileError> apply_delete(const DeleteEdit& edit);
 
+    // Explain provenance chain for an output
+    // Returns list of edits that affected output_name: {EditId, description, first_stage, ops_recomputed, ops_reused}
+    struct ExplainItem {
+        EditId edit_id = 0;
+        std::string edit_description;
+        std::string first_stage;
+        size_t ops_recomputed = 0;
+        size_t ops_reused = 0;
+    };
+    std::string explain_output(const std::string& output_name) const;
+
+    bool is_stage_invalidation() const { return stage_invalidation_; }
+    void set_stage_invalidation(bool val) { stage_invalidation_ = val; }
+
 private:
     Graph& graph_;
     GraphExecutor& executor_;
+    bool stage_invalidation_ = false;
 };
 
 } // namespace retroc

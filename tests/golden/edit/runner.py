@@ -43,6 +43,21 @@ def run_golden_tests():
             print(f"FAILED: verify failed on {f}")
             print(res_ver.stderr)
             sys.exit(1)
+
+        # Check explain if .explain.expected exists
+        explain_exp_path = os.path.join(golden_dir, base + ".explain.expected")
+        if os.path.exists(explain_exp_path):
+            res_exp = subprocess.run([retroc_exe, "explain", rc_path, rcs_path, "avg"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            actual_exp = (res_exp.stdout if res_exp.returncode == 0 else res_exp.stderr).replace("\r\n", "\n")
+            with open(explain_exp_path, "r", encoding="utf-8") as exp_f:
+                expected_exp = exp_f.read().replace("\r\n", "\n")
+            if actual_exp.strip() != expected_exp.strip():
+                print(f"FAILED: explain mismatch in {f}")
+                print("--- Expected ---")
+                print(expected_exp)
+                print("--- Actual ---")
+                print(actual_exp)
+                sys.exit(1)
             
         passed += 1
         total += 1

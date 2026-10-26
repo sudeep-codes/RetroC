@@ -107,13 +107,29 @@ struct RuntimeError {
 // VM: executes bytecode against parameter values and stage values
 class VM {
 public:
-    // Execute bytecode program.
+    // Execute bytecode program with raw array parameters (zero-allocation)
+    static Value execute(
+        const BytecodeProgram& prog,
+        const Value* params,
+        size_t num_params,
+        const std::unordered_map<std::string, Value>& stage_env = empty_stage_env()
+    );
+
+    // Execute bytecode program with vector parameters.
     // Throws RuntimeError (code E501) on zero division, to_int nan/inf, etc.
     static Value execute(
         const BytecodeProgram& prog,
         const std::vector<Value>& params = {},
-        const std::unordered_map<std::string, Value>& stage_env = {}
-    );
+        const std::unordered_map<std::string, Value>& stage_env = empty_stage_env()
+    ) {
+        return execute(prog, params.data(), params.size(), stage_env);
+    }
+
+private:
+    static const std::unordered_map<std::string, Value>& empty_stage_env() {
+        static const std::unordered_map<std::string, Value> empty;
+        return empty;
+    }
 };
 
 } // namespace retroc

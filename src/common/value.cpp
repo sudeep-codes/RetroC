@@ -149,4 +149,14 @@ std::string Value::to_string() const {
     return "";
 }
 
+uint64_t hash_collection(const Collection& col) {
+    uint64_t h = 14695981039346656037ULL;
+    h = hash_combine(h, static_cast<uint64_t>(ValueKind::ARRAY));
+    h = hash_combine(h, col.size());
+    for (const auto& item : col) {
+        h = hash_combine(h, item.value.hash());
+    }
+    return h;
+}
+
 } // namespace retroc

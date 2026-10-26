@@ -1,6 +1,13 @@
 #include "verify/verifier.hpp"
 #include "edit/edit.hpp"
+#include "reuse/propagator.hpp"
+#include "ir/builder.hpp"
+#include "sema/sema.hpp"
+#include "parser/parser.hpp"
+#include "lexer/lexer.hpp"
 #include <iostream>
+#include <fstream>
+#include <filesystem>
 #include <random>
 #include <iomanip>
 #include <sstream>
@@ -15,9 +22,195 @@ struct DiffTestConfig {
     uint32_t seed = 1;
 };
 
+static void dump_failure_artifacts(uint32_t seed, size_t trial_idx,
+                                   const std::string& program_source,
+                                   const EditScript& script,
+                                   const std::string& mismatch_details) {
+    try {
+        std::filesystem::path dir = "tests/diff/failures/" + std::to_string(seed);
+        std::filesystem::create_directories(dir);
+
+        {
+            std::ofstream f(dir / "seed.txt");
+            f << "seed: " << seed << "\ntrial: " << trial_idx << "\n";
+            f << "mismatch:\n" << mismatch_details << "\n";
+        }
+        {
+            std::ofstream f(dir / "program.rc");
+            f << program_source;
+        }
+        {
+            std::ofstream f(dir / "edits.rcs");
+            for (const auto& ed : script.edits) {
+                f << ed->to_string() << "\n";
+            }
+        }
+        std::cerr << "Saved failure artifacts to " << dir.string() << std::endl;
+    } catch (const std::exception& e) {
+        std::cerr << "Error dumping failure artifacts: " << e.what() << std::endl;
+    }
+}
+
+// Tests an invalid edit on a valid running execution and verifies that:
+// (a) the invalid edit is rejected with error E601;
+// (b) the executor/graph state is unchanged (atomic rollback);
+// (c) output values match the pre-edit execution exactly.
+static bool test_invalid_edit(size_t trial_idx, std::mt19937& rng,
+                              const std::string& program_source,
+                              size_t num_records) {
+    Lexer lexer(program_source);
+    auto lex_res = lexer.tokenize();
+    if (std::holds_alternative<CompileError>(lex_res)) return false;
+
+    Parser parser(std::get<std::vector<Token>>(lex_res));
+    auto parse_res = parser.parse();
+    if (std::holds_alternative<CompileError>(parse_res)) return false;
+
+    SemanticAnalyzer sema(std::get<Program>(std::move(parse_res)));
+    auto sema_res = sema.analyze();
+    if (std::holds_alternative<CompileError>(sema_res)) return false;
+
+    IRBuilder builder(std::get<TypedProgram>(sema_res));
+    Graph graph = builder.build();
+
+    GraphExecutor executor(graph, ".", /*enable_memo=*/true);
+    try {
+        executor.run();
+    } catch (...) {
+        return false;
+    }
+
+    auto outputs_before = executor.get_output_values();
+    size_t nodes_count_before = graph.nodes.size();
+
+    Propagator propagator(graph, executor);
+
+    // Pick a kind of invalid edit:
+    // 0: modify invalid RecordId (out of range)
+    // 1: modify nonexistent field
+    // 2: modify with wrong type
+    // 3: insert before INPUT stage
+    // 4: insert with lambda type error
+    // 5: delete INPUT stage
+    // 6: delete last producer of OUTPUT stage
+    int invalid_kind = rng() % 7;
+    std::variant<RebuildPlan, CompileError> res;
+
+    if (invalid_kind == 0) {
+        ModifyEdit bad_mod;
+        bad_mod.input_stage = "rows";
+        bad_mod.record_id = num_records + 100 + (rng() % 100);
+        bad_mod.field_name = "ok";
+        bad_mod.new_value = Value::make_bool(true);
+        bad_mod.raw_literal_text = "true";
+        res = propagator.apply_modify(bad_mod);
+    } else if (invalid_kind == 1) {
+        ModifyEdit bad_mod;
+        bad_mod.input_stage = "rows";
+        bad_mod.record_id = rng() % num_records;
+        bad_mod.field_name = "nonexistent_field_" + std::to_string(rng() % 1000);
+        bad_mod.new_value = Value::make_int(123);
+        bad_mod.raw_literal_text = "123";
+        res = propagator.apply_modify(bad_mod);
+    } else if (invalid_kind == 2) {
+        ModifyEdit bad_mod;
+        bad_mod.input_stage = "rows";
+        bad_mod.record_id = rng() % num_records;
+        bad_mod.field_name = "ok";
+        bad_mod.new_value = Value::make_string("not_a_bool");
+        bad_mod.raw_literal_text = "\"not_a_bool\"";
+        res = propagator.apply_modify(bad_mod);
+    } else if (invalid_kind == 3) {
+        InsertEdit bad_ins;
+        bad_ins.before_stage = "rows"; // cannot insert before INPUT
+        bad_ins.builtin_name = "map";
+        bad_ins.raw_lambda_text = "r => r";
+        res = propagator.apply_insert(bad_ins);
+    } else if (invalid_kind == 4) {
+        InsertEdit bad_ins;
+        // Find a valid non-input stage
+        std::string target_stage;
+        for (const auto& nid : graph.order) {
+            const auto* n = graph.get_node(nid);
+            if (n && n->kind != NodeKind::INPUT && n->kind != NodeKind::OUTPUT) {
+                target_stage = n->name;
+                break;
+            }
+        }
+        if (!target_stage.empty()) {
+            bad_ins.before_stage = target_stage;
+            bad_ins.builtin_name = "map";
+            bad_ins.raw_lambda_text = "x => x.nonexistent_field + 99"; // Typecheck error
+            res = propagator.apply_insert(bad_ins);
+        } else {
+            return true;
+        }
+    } else if (invalid_kind == 5) {
+        DeleteEdit bad_del;
+        bad_del.stage_name = "rows"; // cannot delete INPUT
+        res = propagator.apply_delete(bad_del);
+    } else {
+        DeleteEdit bad_del;
+        // Find direct source of output
+        std::string out_source;
+        for (const auto& out_id : graph.outputs) {
+            const auto* out_node = graph.get_node(out_id);
+            if (out_node && !out_node->inputs.empty()) {
+                const auto* src_node = graph.get_node(out_node->inputs[0]);
+                if (src_node) {
+                    out_source = src_node->name;
+                    break;
+                }
+            }
+        }
+        if (!out_source.empty()) {
+            bad_del.stage_name = out_source;
+            res = propagator.apply_delete(bad_del);
+        } else {
+            return true;
+        }
+    }
+
+    // Must be rejected with CompileError (E601)
+    if (!std::holds_alternative<CompileError>(res)) {
+        std::cerr << "TRIAL #" << trial_idx << ": Invalid edit was NOT rejected!\n";
+        return false;
+    }
+
+    const auto& err = std::get<CompileError>(res);
+    if (err.code != ErrorCode::E601) {
+        std::cerr << "TRIAL #" << trial_idx << ": Invalid edit returned code "
+                  << static_cast<int>(err.code) << " instead of E601\n";
+        return false;
+    }
+
+    // Check atomic rollback: graph nodes count unchanged
+    if (graph.nodes.size() != nodes_count_before) {
+        std::cerr << "TRIAL #" << trial_idx << ": Graph node count changed after rejected edit!\n";
+        return false;
+    }
+
+    // Check outputs unchanged
+    auto outputs_after = executor.get_output_values();
+    if (outputs_before.size() != outputs_after.size()) {
+        std::cerr << "TRIAL #" << trial_idx << ": Output count changed after rejected edit!\n";
+        return false;
+    }
+    for (size_t i = 0; i < outputs_before.size(); ++i) {
+        if (outputs_before[i].first != outputs_after[i].first ||
+            !(outputs_before[i].second == outputs_after[i].second)) {
+            std::cerr << "TRIAL #" << trial_idx << ": Output value changed after rejected edit on "
+                      << outputs_before[i].first << "!\n";
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // Generates a valid program with random records and random modify edits,
 // runs verify_edits (propagated vs rerun from scratch), and validates equality.
-static bool run_trial(size_t trial_idx, std::mt19937& rng) {
+static bool run_trial(size_t trial_idx, uint32_t seed, std::mt19937& rng) {
     // Generate 1-2 inputs
     size_t num_records = 5 + (rng() % 20); // 5 to 24 records
 
@@ -68,8 +261,6 @@ static bool run_trial(size_t trial_idx, std::mt19937& rng) {
     std::string program_source = src.str();
 
     // Track stages present in the program for generating valid insert / delete / modify edits
-    // in_elem_type is the element type of the collection consumed by the stage
-    // out_elem_type is the element type produced by the stage (for map/filter)
     struct StageInfo {
         std::string name;
         std::string in_elem_type;  // element type consumed by this stage
@@ -92,7 +283,6 @@ static bool run_trial(size_t trial_idx, std::mt19937& rng) {
     // Generate 1 to 4 random edits (modify, insert, delete)
     size_t num_edits = 1 + (rng() % 4);
     EditScript script;
-
     int gen_counter = 1;
 
     for (size_t e = 0; e < num_edits; ++e) {
@@ -133,8 +323,6 @@ static bool run_trial(size_t trial_idx, std::mt19937& rng) {
                 std::string new_name = "ins_" + std::to_string(trial_idx) + "_" + std::to_string(gen_counter++);
                 ins->new_stage_name = new_name;
 
-                // The inserted stage is placed before target_stage, so its input is target_stage.in_elem_type
-                // and it must produce target_stage.in_elem_type so target_stage continues to typecheck!
                 if (target_stage.in_elem_type == "row") {
                     if (rng() % 2 == 0) {
                         ins->builtin_name = "filter";
@@ -178,13 +366,16 @@ static bool run_trial(size_t trial_idx, std::mt19937& rng) {
     if (!res.ok) {
         std::cerr << "TRIAL #" << trial_idx << " FAILED!\n";
         std::cerr << "Mismatch details:\n" << res.mismatch_details << "\n";
-        std::cerr << "Program source:\n" << program_source << "\n";
-        std::cerr << "Edits:\n";
-        for (const auto& ed : script.edits) {
-            std::cerr << "  " << ed->to_string() << "\n";
-        }
+        dump_failure_artifacts(seed, trial_idx, program_source, script, res.mismatch_details);
         return false;
     }
+
+    // Also run an invalid-edit test on this generated program to ensure rejection + zero side effects
+    if (!test_invalid_edit(trial_idx, rng, program_source, num_records)) {
+        dump_failure_artifacts(seed, trial_idx, program_source, script, "Invalid edit verification failed");
+        return false;
+    }
+
     return true;
 }
 
@@ -206,8 +397,8 @@ int main(int argc, char* argv[]) {
     size_t passed = 0;
 
     for (size_t i = 0; i < config.trials; ++i) {
-        if (!run_trial(i + 1, rng)) {
-            return 3; // Exit code 3: verification mismatch
+        if (!run_trial(i + 1, config.seed, rng)) {
+            return 3; // Exit code 3: verification mismatch per ARCHITECTURE.md
         }
         passed++;
         if ((i + 1) % 100 == 0 || (i + 1) == config.trials) {

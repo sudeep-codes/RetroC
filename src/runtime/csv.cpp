@@ -87,21 +87,25 @@ Collection load_csv(const std::string& path, const TypePtr& elem_type) {
                 size_t col_idx = col_map[f.name];
                 std::string cell_str = col_idx < row.size() ? row[col_idx] : "";
                 Value val;
-                switch (f.type->kind) {
-                    case TypeKind::INT:
-                        val = Value::make_int(std::stoll(cell_str));
-                        break;
-                    case TypeKind::FLOAT:
-                        val = Value::make_float(std::stod(cell_str));
-                        break;
-                    case TypeKind::BOOL:
-                        val = Value::make_bool(cell_str == "true" || cell_str == "1");
-                        break;
-                    case TypeKind::STRING:
-                        val = Value::make_string(cell_str);
-                        break;
-                    default:
-                        throw RuntimeError("Non-flat type in CSV record field: " + f.name);
+                try {
+                    switch (f.type->kind) {
+                        case TypeKind::INT:
+                            val = Value::make_int(cell_str.empty() ? 0 : std::stoll(cell_str));
+                            break;
+                        case TypeKind::FLOAT:
+                            val = Value::make_float(cell_str.empty() ? 0.0 : std::stod(cell_str));
+                            break;
+                        case TypeKind::BOOL:
+                            val = Value::make_bool(cell_str == "true" || cell_str == "1");
+                            break;
+                        case TypeKind::STRING:
+                            val = Value::make_string(cell_str);
+                            break;
+                        default:
+                            throw RuntimeError("Non-flat type in CSV record field: " + f.name);
+                    }
+                } catch (const std::exception& e) {
+                    throw RuntimeError("Failed parsing CSV field '" + f.name + "' with value '" + cell_str + "' at row line: " + e.what());
                 }
                 record_fields.push_back(RecordField{f.name, std::make_shared<Value>(std::move(val))});
             }
@@ -110,6 +114,53 @@ Collection load_csv(const std::string& path, const TypePtr& elem_type) {
     }
 
     return result;
+}
+
+void save_csv(const std::string& path, const Collection& collection, const TypePtr& elem_type) {
+    std::ofstream file(path);
+    if (!file.is_open()) {
+        throw RuntimeError("Cannot open CSV file for writing: " + path);
+    }
+
+    if (!elem_type || elem_type->kind != TypeKind::RECORD) {
+        return;
+    }
+
+    // Write header
+    for (size_t i = 0; i < elem_type->fields.size(); ++i) {
+        if (i > 0) file << ",";
+        file << elem_type->fields[i].name;
+    }
+    file << "\n";
+
+    // Write rows
+    for (const auto& item : collection) {
+        if (item.value.kind != ValueKind::RECORD) continue;
+        for (size_t i = 0; i < elem_type->fields.size(); ++i) {
+            if (i > 0) file << ",";
+            const auto& fname = elem_type->fields[i].name;
+            bool found = false;
+            for (const auto& rf : item.value.record_val) {
+                if (rf.name == fname && rf.value) {
+                    if (rf.value->kind == ValueKind::STRING) {
+                        file << rf.value->string_val;
+                    } else if (rf.value->kind == ValueKind::BOOL) {
+                        file << (rf.value->bool_val ? "true" : "false");
+                    } else if (rf.value->kind == ValueKind::INT) {
+                        file << rf.value->int_val;
+                    } else if (rf.value->kind == ValueKind::FLOAT) {
+                        file << format_float(rf.value->float_val);
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                file << "";
+            }
+        }
+        file << "\n";
+    }
 }
 
 } // namespace retroc

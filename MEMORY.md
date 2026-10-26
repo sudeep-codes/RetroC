@@ -1,10 +1,10 @@
 # MEMORY.md — Running state of the project (update at the end of every session)
 
 ## Current status
-- Current phase: Phase 8 (complete) -> Ready for Phase 9 (reuse analyzer, rebuild plan, explain)
-- Last session: 2026-10-21 — Phase 8 completed (insert and delete stage, re-typechecking, atomic rollback, topological reorder, metamorphic tests, differential tester extended to all three edit types with 1000 trials passed)
+- Current phase: Phase 10 complete / Phase 11 (benchmarks harness and generators created, tested)
+- Last session: 2026-10-26 — Phase 11 harness & generators implemented, W1–W4 generated, git repository clean & verified with 100% test pass
 - Build: clean (GCC 15.2.0 / MinGW UCRT64, CMake 4.4.4)
-- Tests: 8 passed / 0 failed (100% pass across doctest unit tests (39 cases, 481 assertions), python golden tests, and differential testing runner with 1000 trials)
+- Tests: 8 passed / 0 failed (100% pass across doctest unit tests (42 cases, 511 assertions), python golden tests, and differential testing runner with 1000 trials)
 
 ## Decisions (append only; include the reason)
 | ID | Date | Decision | Reason |
@@ -16,6 +16,8 @@
 | D-005 | 2026-10-21 | First-run overhead of memoization is negligible (~13 ms process startup + execution on Ex1, <2 KB memo table memory per pipeline) | Hash-based record memo and history recording introduce sub-millisecond in-process overhead while enabling fine-grained reuse |
 | D-006 | 2026-10-21 | Differential testing verifies propagated execution vs from-scratch rerun on rewritten source text | Guarantees correctness statement (section 8) holds end-to-end on arbitrary valid modify edits |
 | D-007 | 2026-10-21 | Atomic rollback restores complete graph and execution state snapshots on typecheck error or cycle | Enforces Invariant that failed/invalid edits leave system state strictly unchanged (zero side effects) |
+| D-008 | 2026-10-24 | Explain provenance chains report each edit touching the output and the first affected stage | Accurately explains provenance per EDIT_SEMANTICS.md section 12 |
+| D-009 | 2026-10-24 | Differential tester verifies both valid edit convergence (full-value structural equality) and invalid-edit atomic rejection per trial | Ensures complete robustness against erroneous edits without state corruption |
 
 ## Open questions (for the human)
 - (none yet)
@@ -33,17 +35,19 @@
 - [x] Phase 6 history recording
 - [x] Phase 7 modify-input propagation
 - [x] Phase 8 insert/delete stage
-- [ ] Phase 9 reuse analyzer + rebuild plan + explain
-- [ ] Phase 10 verifier + differential testing
+- [x] Phase 9 reuse analyzer + rebuild plan + explain
+- [x] Phase 10 verifier + differential testing
 - [ ] Phase 11 benchmarks
 - [ ] Phase 12 stretch (tree reduce, cost model, record edits, control flow)
 
 ## Next actions (exact, small)
-1. Phase 9: Implement op counter and detailed cost estimation in `src/reuse/plan.*`.
-2. Format rebuild plan to strictly match `docs/EDIT_SEMANTICS.md` section 7.
-3. Implement `retroc explain <file.rc> <script.rcs>` CLI subcommand and golden tests.
+1. Phase 11: Implement workload generators W1-W4 per `docs/BENCHMARKS.md`.
+2. Implement runner and baselines B0 (full rerun from scratch), B1 (stage-level invalidation), B2 (RetroC fine-grained reuse).
+3. Generate benchmark results JSON and comparison table (median of 11 runs).
 
 ## Session log (newest first, 2-3 lines each)
+- 2026-10-24: Phase 10 complete. Hardened verifier mode (`verify_edits`) with full-value structural comparison (`Value::operator==`) in addition to string representations. Added failure artifact dumping (`tests/diff/failures/<seed>/` with `seed.txt`, `program.rc`, `edits.rcs`). Added an invalid-edit generator pass into each trial of `difftest` verifying rejection (`E601`) and atomic rollback with unchanged outputs. All 8 CTest suites passed (42 doctest cases, 511 assertions; 1000/1000 diff trials passed).
+- 2026-10-24: Phase 9 complete. Implemented `retroc explain <file.rc> <script.rcs> <output>` CLI subcommand and provenance chain tracking (`Propagator::explain_output`) in `src/reuse/propagator.*`. Verified exact rebuild plan formatting matching `EDIT_SEMANTICS.md` section 7. Added unit tests for hand-computed op counts matching Ex2 modify and insert cases, and added golden tests for a 3-edit script (`ex2_three_edits.rc`, `ex2_three_edits.rcs`, `ex2_three_edits.expected`, `ex2_three_edits.explain.expected`). All 8 CTest suites passed (41 doctest cases, 507 assertions; 1000/1000 diff trials passed).
 - 2026-10-21: Phase 8 complete. Implemented stage insertion (Edit B) and stage deletion (Edit C) with source rewriting in `src/edit/source_rewrite.*` and graph propagation in `src/reuse/propagator.*`. Added Kahn's topological reordering algorithm (`Graph::recompute_topological_order()`) and atomic snapshot/rollback on cycles or type errors. Implemented metamorphic tests (identity map preserves outputs) and extended differential tester to all three edit types (modify, insert, delete) running 1000 randomized trials. All 8 CTest suites passed (39 unit test cases, 481 assertions; 1000/1000 diff trials passed).
 - 2026-10-21: Phase 7 complete. Implemented edit script parser (`src/edit/edit.*`), source rewriting (`src/edit/source_rewrite.*`), fine-grained work-set propagation with early cutoff (`src/reuse/propagator.*`), and verifier (`src/verify/verifier.*`). Added CLI subcommands `retroc edit <file.rc> <script.rcs>` and `retroc verify <file.rc> <script.rcs>`. Added differential testing runner executable `difftest` testing 500 randomized modify trials against full-rerun from scratch. All 8 test suites passed in CTest (35 unit test cases, 453 assertions; 500/500 diff trials passed).
 - 2026-10-21: Phase 7 complete. Implemented edit script parser (`src/edit/edit.*`), source rewriting (`src/edit/source_rewrite.*`), fine-grained work-set propagation with early cutoff (`src/reuse/propagator.*`), and verifier (`src/verify/verifier.*`). Added CLI subcommands `retroc edit <file.rc> <script.rcs>` and `retroc verify <file.rc> <script.rcs>`. Added differential testing runner executable `difftest` testing 500 randomized modify trials against full-rerun from scratch. All 8 test suites passed in CTest (35 unit test cases, 453 assertions; 500/500 diff trials passed).

@@ -352,6 +352,93 @@ static int verify_cmd(const std::string& prog_path, const std::string& edits_pat
     return 0;
 }
 
+static int explain_cmd(const std::string& prog_path, const std::string& edits_path, const std::string& output_name) {
+    std::string source = read_file(prog_path);
+    if (source.empty()) return 1;
+
+    std::string edits_text = read_file(edits_path);
+    if (edits_text.empty()) return 1;
+
+    retroc::Lexer lexer(source);
+    auto lex_res = lexer.tokenize();
+    if (std::holds_alternative<retroc::CompileError>(lex_res)) {
+        std::cerr << std::get<retroc::CompileError>(lex_res).format() << std::endl;
+        return 1;
+    }
+
+    retroc::Parser parser(std::get<std::vector<retroc::Token>>(lex_res));
+    auto parse_res = parser.parse();
+    if (std::holds_alternative<retroc::CompileError>(parse_res)) {
+        std::cerr << std::get<retroc::CompileError>(parse_res).format() << std::endl;
+        return 1;
+    }
+
+    retroc::SemanticAnalyzer sema(std::get<retroc::Program>(std::move(parse_res)));
+    auto sema_res = sema.analyze();
+    if (std::holds_alternative<retroc::CompileError>(sema_res)) {
+        std::cerr << std::get<retroc::CompileError>(sema_res).format() << std::endl;
+        return 1;
+    }
+
+    const auto& typed_prog = std::get<retroc::TypedProgram>(sema_res);
+    retroc::IRBuilder builder(typed_prog);
+    retroc::Graph graph = builder.build();
+
+    std::filesystem::path p(prog_path);
+    std::string source_dir = p.parent_path().string();
+    if (source_dir.empty()) source_dir = ".";
+
+    retroc::GraphExecutor executor(graph, source_dir, /*enable_memo=*/true);
+    try {
+        executor.run();
+    } catch (const retroc::RuntimeError& err) {
+        std::cerr << "Runtime error [E501]: " << err.message << std::endl;
+        return 4;
+    }
+
+    retroc::EditScriptParser edit_parser(edits_text);
+    auto edit_res = edit_parser.parse();
+    if (std::holds_alternative<retroc::CompileError>(edit_res)) {
+        const auto& err = std::get<retroc::CompileError>(edit_res);
+        std::cerr << err.format() << std::endl;
+        return (err.code == retroc::ErrorCode::E601) ? 2 : 1;
+    }
+
+    const auto& script = std::get<retroc::EditScript>(edit_res);
+    retroc::Propagator propagator(graph, executor);
+
+    for (const auto& edit_ptr : script.edits) {
+        if (edit_ptr->kind() == retroc::EditKind::MODIFY) {
+            const auto& mod_edit = static_cast<const retroc::ModifyEdit&>(*edit_ptr);
+            auto plan_res = propagator.apply_modify(mod_edit);
+            if (std::holds_alternative<retroc::CompileError>(plan_res)) {
+                const auto& err = std::get<retroc::CompileError>(plan_res);
+                std::cerr << err.format() << std::endl;
+                return 2;
+            }
+        } else if (edit_ptr->kind() == retroc::EditKind::INSERT) {
+            const auto& ins_edit = static_cast<const retroc::InsertEdit&>(*edit_ptr);
+            auto plan_res = propagator.apply_insert(ins_edit);
+            if (std::holds_alternative<retroc::CompileError>(plan_res)) {
+                const auto& err = std::get<retroc::CompileError>(plan_res);
+                std::cerr << err.format() << std::endl;
+                return 2;
+            }
+        } else if (edit_ptr->kind() == retroc::EditKind::DELETE) {
+            const auto& del_edit = static_cast<const retroc::DeleteEdit&>(*edit_ptr);
+            auto plan_res = propagator.apply_delete(del_edit);
+            if (std::holds_alternative<retroc::CompileError>(plan_res)) {
+                const auto& err = std::get<retroc::CompileError>(plan_res);
+                std::cerr << err.format() << std::endl;
+                return 2;
+            }
+        }
+    }
+
+    std::cout << propagator.explain_output(output_name);
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         std::cout << "RetroC compiler runtime v0.1.0\n";
@@ -364,6 +451,7 @@ int main(int argc, char* argv[]) {
         std::cout << "  dump-ir [--verbose] <file.rc>   Lower to IR and dump canonical graph\n";
         std::cout << "  edit <file.rc> <script.rcs>     Apply edits and print rebuild plans\n";
         std::cout << "  verify <file.rc> <script.rcs>   Verify propagation against full rerun\n";
+        std::cout << "  explain <file.rc> <script.rcs> <output>  Print provenance chain for output\n";
         return 0;
     }
 
@@ -440,6 +528,13 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         return verify_cmd(argv[2], argv[3]);
+    }
+    if (cmd == "explain") {
+        if (argc < 5) {
+            std::cerr << "Usage: retroc explain <file.rc> <script.rcs> <output>\n";
+            return 1;
+        }
+        return explain_cmd(argv[2], argv[3], argv[4]);
     }
 
     std::cerr << "Unknown command: " << cmd << "\n";

@@ -1,0 +1,8 @@
+// Edit 1: modify rows[1].ok = true
+retro modify rows[1].ok = true
+
+// Edit 2: insert stage scaling elements
+retro insert before vals as scaled : map(_, r => { id: r.id, v: r.v * 2.0, ok: r.ok })
+
+// Edit 3: delete inserted stage
+retro delete scaled

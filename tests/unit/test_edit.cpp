@@ -374,3 +374,159 @@ output ys;
     CHECK(res.propagated_outputs[0].second == "[2.0, 4.0, 6.0]");
 }
 
+TEST_CASE("Phase 9: Hand-computed op counts match for Ex2 modify and insert") {
+    // Ex2:
+    // clean: filter 3 elements
+    // vals: map
+    // sum: reduce
+    // avg: scalar
+    std::string src = R"(
+input rows: [{ id: int, v: float, ok: bool }] = [
+  { id: 1, v: 2.0, ok: true },
+  { id: 2, v: 5.0, ok: false },
+  { id: 3, v: 4.0, ok: true }
+];
+let clean = filter(rows, r => r.ok);
+let vals = map(clean, r => r.v);
+let sum = reduce(vals, 0.0, (a, x) => a + x);
+let avg = sum / to_float(length(vals));
+output avg;
+)";
+
+    Graph g = parse_and_build(src);
+    GraphExecutor executor(g, ".", /*enable_memo=*/true);
+    executor.run();
+
+    Propagator prop(g, executor);
+
+    // 1. Modify rows[1].ok = true
+    ModifyEdit mod;
+    mod.input_stage = "rows";
+    mod.record_id = 1;
+    mod.field_name = "ok";
+    mod.new_value = Value::make_bool(true);
+    mod.raw_literal_text = "true";
+
+    auto mod_res = prop.apply_modify(mod);
+    REQUIRE(std::holds_alternative<RebuildPlan>(mod_res));
+    const auto& mod_plan = std::get<RebuildPlan>(mod_res);
+
+    // Hand-computed op counts per EDIT_SEMANTICS.md section 9:
+    // clean evaluated 1 / 3, reused 2
+    // vals evaluated 1 / 3, reused 2
+    // sum evaluated 3 / 3, reused 0
+    // avg evaluated 1 / 1, reused 0
+    // Total recomputed: 1 + 1 + 3 + 1 = 6 ops
+    // Total reused: 2 + 2 = 4 ops
+    // Full rerun cost: 3 + 3 + 3 + 1 = 10 ops
+    CHECK(mod_plan.recomputed_ops == 6);
+    CHECK(mod_plan.reused_ops == 4);
+    CHECK(mod_plan.full_rerun_ops == 10);
+    CHECK(mod_plan.reuse_percent == doctest::Approx(40.0));
+
+    // 2. Insert case: insert stage before vals as scaled : map(_, r => { id: r.id, v: r.v * 2.0, ok: r.ok })
+    InsertEdit ins;
+    ins.before_stage = "vals";
+    ins.new_stage_name = "scaled";
+    ins.builtin_name = "map";
+    ins.raw_lambda_text = "r => { id: r.id, v: r.v * 2.0, ok: r.ok }";
+
+    auto ins_res = prop.apply_insert(ins);
+    REQUIRE(std::holds_alternative<RebuildPlan>(ins_res));
+    const auto& ins_plan = std::get<RebuildPlan>(ins_res);
+
+    // scaled NEW: evaluated 3 / 3
+    // vals FULL: evaluated 3 / 3
+    // sum FULL: evaluated 3 / 3
+    // avg FULL: evaluated 1 / 1
+    // Total recomputed: 3 + 3 + 3 + 1 = 10 ops
+    // Total reused: 0 ops
+    // Full rerun cost: 10 ops
+    CHECK(ins_plan.recomputed_ops == 10);
+    CHECK(ins_plan.reused_ops == 0);
+    CHECK(ins_plan.full_rerun_ops == 10);
+    CHECK(ins_plan.reuse_percent == doctest::Approx(0.0));
+}
+
+TEST_CASE("Phase 9: Explain output provenance chain for 3-edit script") {
+    std::string src = R"(
+input rows: [{ id: int, v: float, ok: bool }] = [
+  { id: 1, v: 2.0, ok: true },
+  { id: 2, v: 5.0, ok: false },
+  { id: 3, v: 4.0, ok: true }
+];
+let clean = filter(rows, r => r.ok);
+let vals = map(clean, r => r.v);
+let sum = reduce(vals, 0.0, (a, x) => a + x);
+let avg = sum / to_float(length(vals));
+output avg;
+)";
+
+    Graph g = parse_and_build(src);
+    GraphExecutor executor(g, ".", /*enable_memo=*/true);
+    executor.run();
+
+    Propagator prop(g, executor);
+
+    // Edit 1: modify rows[1].ok = true
+    ModifyEdit e1;
+    e1.input_stage = "rows";
+    e1.record_id = 1;
+    e1.field_name = "ok";
+    e1.new_value = Value::make_bool(true);
+    e1.raw_literal_text = "true";
+    auto r1 = prop.apply_modify(e1);
+    REQUIRE(std::holds_alternative<RebuildPlan>(r1));
+
+    // Edit 2: insert stage before vals
+    InsertEdit e2;
+    e2.before_stage = "vals";
+    e2.new_stage_name = "scaled";
+    e2.builtin_name = "map";
+    e2.raw_lambda_text = "r => { id: r.id, v: r.v * 2.0, ok: r.ok }";
+    auto r2 = prop.apply_insert(e2);
+    REQUIRE(std::holds_alternative<RebuildPlan>(r2));
+
+    // Edit 3: delete scaled stage
+    DeleteEdit e3;
+    e3.stage_name = "scaled";
+    auto r3 = prop.apply_delete(e3);
+    REQUIRE(std::holds_alternative<RebuildPlan>(r3));
+
+    std::string explanation = prop.explain_output("avg");
+    CHECK(explanation.find("Explain avg:") != std::string::npos);
+    CHECK(explanation.find("Edit #1:") != std::string::npos);
+    CHECK(explanation.find("first stage: rows") != std::string::npos);
+    CHECK(explanation.find("Edit #2:") != std::string::npos);
+    CHECK(explanation.find("first stage: scaled") != std::string::npos);
+    CHECK(explanation.find("Edit #3:") != std::string::npos);
+    CHECK(explanation.find("first stage: vals") != std::string::npos);
+}
+
+TEST_CASE("Phase 10: Verifier mode checks full-value structural equality") {
+    std::string src = R"(
+input rows: [{ id: int, v: float, ok: bool }] = [
+  { id: 1, v: 2.5, ok: true },
+  { id: 2, v: 7.5, ok: true }
+];
+let doubled = map(rows, r => { id: r.id, v: r.v * 2.0, ok: r.ok });
+output doubled;
+)";
+    EditScript script;
+    auto mod = std::make_shared<ModifyEdit>();
+    mod->input_stage = "rows";
+    mod->record_id = 0;
+    mod->field_name = "v";
+    mod->new_value = Value::make_float(3.5);
+    mod->raw_literal_text = "3.5";
+    script.edits.push_back(mod);
+
+    auto res = verify_edits(src, script);
+    CHECK(res.ok == true);
+    REQUIRE(res.propagated_output_values.size() == 1);
+    REQUIRE(res.rerun_output_values.size() == 1);
+    CHECK(res.propagated_output_values[0].second == res.rerun_output_values[0].second);
+}
+
+
+

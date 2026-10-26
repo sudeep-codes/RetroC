@@ -11,6 +11,8 @@ struct VerificationResult {
     std::string mismatch_details;
     std::vector<std::pair<std::string, std::string>> propagated_outputs;
     std::vector<std::pair<std::string, std::string>> rerun_outputs;
+    std::vector<std::pair<std::string, Value>> propagated_output_values;
+    std::vector<std::pair<std::string, Value>> rerun_output_values;
 };
 
 // Compares the output of propagating edits on an active execution

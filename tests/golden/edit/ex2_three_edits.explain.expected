@@ -1,0 +1,10 @@
+Explain avg:
+  Edit #1: retro modify rows[1].ok = true
+    first stage: rows
+    recomputed:  6 ops, reused: 4 ops
+  Edit #2: retro insert before vals as scaled : map(_, r => { id : r . id , v : r . v * 2.0 , ok : r . ok })
+    first stage: scaled
+    recomputed:  10 ops, reused: 0 ops
+  Edit #3: retro delete scaled
+    first stage: vals
+    recomputed:  7 ops, reused: 0 ops

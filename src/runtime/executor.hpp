@@ -15,6 +15,26 @@ struct NodeExecutionResult {
     Collection collection_val;
     Value scalar_val;
 
+    // Fast hash without constructing a temporary Value::make_array
+    uint64_t hash() const {
+        if (is_collection) {
+            return hash_collection(collection_val);
+        }
+        return scalar_val.hash();
+    }
+
+    // Lightweight representation for stage_values: scalars are preserved;
+    // collections don't duplicate 100k items in memory just to represent the stage.
+    Value as_stage_value() const {
+        if (is_collection) {
+            Value val;
+            val.kind = ValueKind::ARRAY;
+            val.int_val = static_cast<int64_t>(collection_val.size());
+            return val;
+        }
+        return scalar_val;
+    }
+
     // Convert to a printable or representative single Value
     Value as_value() const {
         if (is_collection) {
@@ -34,6 +54,15 @@ public:
     explicit GraphExecutor(Graph& graph, std::string source_dir = ".", bool enable_memo = true)
         : graph_(graph), source_dir_(std::move(source_dir)), enable_memo_(enable_memo) {}
 
+    GraphExecutor(Graph& graph, const GraphExecutor& other)
+        : graph_(graph),
+          source_dir_(other.source_dir_),
+          enable_memo_(other.enable_memo_),
+          results_(other.results_),
+          stage_values_(other.stage_values_),
+          outputs_(other.outputs_),
+          history_(other.history_) {}
+
     // Executes the entire graph from scratch.
     // If output_stream is provided, prints "name = <value>\n" for each OUTPUT node.
     // Returns 0 on success, or throws RuntimeError on E501.
@@ -44,6 +73,9 @@ public:
 
     // Get all output values as (stage_name, string_representation)
     std::vector<std::pair<std::string, std::string>> get_outputs() const;
+
+    // Get all output values as full Value objects (stage_name, Value)
+    std::vector<std::pair<std::string, Value>> get_output_values() const;
 
     // History log of runs/edits
     const HistoryLog& get_history() const { return history_; }
@@ -60,6 +92,30 @@ public:
     std::vector<std::pair<std::string, std::string>>& mutable_outputs() { return outputs_; }
     const std::string& source_dir() const { return source_dir_; }
     bool enable_memo() const { return enable_memo_; }
+
+    // Pre-cache or provide in-memory CSV collections so repeated benchmark runs don't re-read disk
+    static std::unordered_map<std::string, Collection>& csv_cache() {
+        static std::unordered_map<std::string, Collection> cache;
+        return cache;
+    }
+
+    struct StateSnapshot {
+        std::unordered_map<NodeId, NodeExecutionResult> results;
+        std::unordered_map<std::string, Value> stage_values;
+        std::vector<std::pair<std::string, std::string>> outputs;
+        HistoryLog history;
+    };
+
+    StateSnapshot snapshot() const {
+        return StateSnapshot{results_, stage_values_, outputs_, history_};
+    }
+
+    void restore(const StateSnapshot& snap) {
+        results_ = snap.results;
+        stage_values_ = snap.stage_values;
+        outputs_ = snap.outputs;
+        history_ = snap.history;
+    }
 
 private:
     void execute_node(Node& node, HistoryEntry& entry);

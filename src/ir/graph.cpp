@@ -7,6 +7,7 @@
 namespace retroc {
 
 void Graph::assert_invariants() const {
+#ifndef NDEBUG
     // Invariant I2: NodeIds are unique and match the keys in nodes map
     // (std::map naturally has unique keys; verify each node.id == key)
     std::unordered_set<NodeId> seen_ids;
@@ -41,6 +42,7 @@ void Graph::assert_invariants() const {
     for (const auto& out_id : outputs) {
         assert(nodes.find(out_id) != nodes.end() && "Output references non-existent node");
     }
+#endif
 }
 
 bool Graph::recompute_topological_order() {

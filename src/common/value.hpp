@@ -91,6 +91,12 @@ struct Value {
     std::string to_string() const;
 };
 
+struct ValueHasher {
+    size_t operator()(const Value& v) const noexcept {
+        return static_cast<size_t>(v.hash());
+    }
+};
+
 // Represents a collection of records with stable RecordIds: vector of (RecordId, Value)
 struct CollectionItem {
     RecordId id;
@@ -102,5 +108,8 @@ using Collection = std::vector<CollectionItem>;
 // Deterministic float printing per LANGUAGE_SPEC.md section 6:
 // "shortest round-trip decimal, always with a . (e.g. 3.0, 0.25)"
 std::string format_float(double val);
+
+// Hash a collection directly without copying elements into a Value::ARRAY
+uint64_t hash_collection(const Collection& col);
 
 } // namespace retroc

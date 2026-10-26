@@ -1485,4 +1485,37 @@ std::variant<RebuildPlan, CompileError> Propagator::apply_delete(const DeleteEdi
     return plan;
 }
 
+std::string Propagator::explain_output(const std::string& output_name) const {
+    const auto& history = executor_.get_history();
+    std::ostringstream oss;
+    oss << "Explain " << output_name << ":\n";
+
+    size_t count = 0;
+    for (const auto& entry : history.entries) {
+        if (entry.edit_id == 0) {
+            continue; // Skip initial run
+        }
+        bool changed = false;
+        for (const auto& out : entry.outputs_changed) {
+            if (out == output_name) {
+                changed = true;
+                break;
+            }
+        }
+        if (changed) {
+            count++;
+            std::string first_stage = entry.nodes_touched.empty() ? "(unknown)" : entry.nodes_touched.front();
+            oss << "  Edit #" << entry.edit_id << ": " << entry.description << "\n";
+            oss << "    first stage: " << first_stage << "\n";
+            oss << "    recomputed:  " << entry.ops_recomputed << " ops, reused: " << entry.ops_reused << " ops\n";
+        }
+    }
+
+    if (count == 0) {
+        oss << "  (no edits changed output '" << output_name << "')\n";
+    }
+
+    return oss.str();
+}
+
 } // namespace retroc
