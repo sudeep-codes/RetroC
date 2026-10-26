@@ -1,0 +1,3 @@
+// Modify record 3 (value 40 -> 90). In a linear fold, elements 3..7 would recompute (5 steps).
+// In RetroC tree_reduce, only log2(8) = 3 binary combiner nodes ascend to root!
+retro modify numbers[3] = 90

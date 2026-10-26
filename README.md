@@ -86,16 +86,27 @@ The resulting binaries will be placed in `build/`:
 
 ---
 
-## Quickstart: Running the 1-Minute Demo
+## Quickstart: Running the Demonstrations
 
-A self-contained sensor log demonstration is provided in `demo/`. It executes a realistic sensor log processing pipeline, modifies a faulty reading in-place, inserts an offset calibration stage, deletes the calibration stage, verifies output correctness against a full rerun, and prints the causal provenance chain.
+### 1. Professor Presentation Demo (Interactive & Detailed)
+An interactive presentation demonstration designed for project evaluations and technical walkthroughs with full step-by-step theoretical commentary:
 
-### On Windows:
+```cmd
+demo\prof_demo.bat
+```
+*(Or via PowerShell: `powershell -ExecutionPolicy Bypass -File demo\prof_demo.ps1`)*
+
+For an accompanying slide-by-slide oral talking script, anticipated questions, and rigorous technical answers, consult the **[Professor Walkthrough Guide](demo/DEMO_WALKTHROUGH.md)**.
+
+### 2. Fast 5-Second Automated Demo
+A quick automated demo running the sensor log pipeline, 3 edits, verification, and provenance in seconds:
+
+#### On Windows:
 ```cmd
 demo\run_demo.bat
 ```
 
-### On Linux / macOS:
+#### On Linux / macOS:
 ```bash
 chmod +x demo/run_demo.sh
 ./demo/run_demo.sh
