@@ -1,0 +1,16 @@
+// Sensor log pipeline: filter valid temperature readings, convert C to F, and compute average
+input sensor_readings: [{ id: int, temp_c: float, valid: bool }] = [
+  { id: 101, temp_c: 21.5, valid: true },
+  { id: 102, temp_c: -999.0, valid: false },
+  { id: 103, temp_c: 24.0, valid: true },
+  { id: 104, temp_c: 22.8, valid: true },
+  { id: 105, temp_c: 23.2, valid: true }
+];
+
+let valid_readings = filter(sensor_readings, r => r.valid);
+let temp_f = map(valid_readings, r => r.temp_c * 1.8 + 32.0);
+let sum_f = reduce(temp_f, 0.0, (acc, t) => acc + t);
+let count = to_float(length(temp_f));
+let avg_temp_f = sum_f / count;
+
+output avg_temp_f;

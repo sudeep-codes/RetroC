@@ -1,0 +1,9 @@
+// Edit 1 (Modify): Sensor reading 102 was manually re-calibrated from faulty -999.0 to 22.0 and marked valid
+retro modify sensor_readings[1].temp_c = 22.0
+retro modify sensor_readings[1].valid = true
+
+// Edit 2 (Insert): Insert sensor offset calibration stage (+0.5 C bias correction)
+retro insert before temp_f as calibrated : map(_, r => { id: r.id, temp_c: r.temp_c + 0.5, valid: r.valid })
+
+// Edit 3 (Delete): Discard temporary calibration stage
+retro delete calibrated
