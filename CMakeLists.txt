@@ -112,6 +112,7 @@ add_executable(unit_tests
     tests/unit/test_ir.cpp
     tests/unit/test_runtime.cpp
     tests/unit/test_edit.cpp
+    tests/unit/test_tree_reduce.cpp
 )
 target_link_libraries(unit_tests PRIVATE rc_verify)
 target_include_directories(unit_tests PRIVATE tests/unit)

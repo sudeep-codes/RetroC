@@ -13,7 +13,7 @@ struct SemaException {
 // Check if identifier is one of the built-in function names
 bool is_builtin(const std::string& name) {
     static const std::unordered_set<std::string> builtins = {
-        "filter", "map", "reduce", "join", "length",
+        "filter", "map", "reduce", "tree_reduce", "join", "length",
         "to_float", "to_int", "abs", "min", "max", "clamp"
     };
     return builtins.find(name) != builtins.end();
@@ -561,6 +561,56 @@ TypePtr SemanticAnalyzer::check_builtin_call(CallExpr* expr, const std::string& 
         typed_prog_.lambda_param_types[lam] = {init_type, elem_type};
         typed_prog_.expr_types[lam] = ret_type;
         return init_type;
+    }
+
+    if (name == "tree_reduce") {
+        // tree_reduce(c, init, f) : [T], T, (T, T)->T -> T
+        if (expr->args.size() != 3) {
+            throw SemaException{error(ErrorCode::E303, expr->loc, "tree_reduce expects 3 arguments: tree_reduce(collection, init, lambda)")};
+        }
+        TypePtr col_type = check_expr(expr->args[0].get());
+        if (col_type->kind != TypeKind::ARRAY) {
+            throw SemaException{error(ErrorCode::E303, expr->args[0]->loc, "first argument to tree_reduce must be an array [T], got " + col_type->to_string())};
+        }
+        TypePtr elem_type = col_type->element_type;
+        TypePtr init_type = check_expr(expr->args[1].get());
+
+        if (!types_equal(elem_type, init_type)) {
+            throw SemaException{error(ErrorCode::E301, expr->args[1]->loc,
+                "tree_reduce associative combiner requires init type to match collection element type " + elem_type->to_string() + ", got " + init_type->to_string())};
+        }
+
+        if (expr->args[2]->kind != ExprKind::LAMBDA) {
+            throw SemaException{error(ErrorCode::E303, expr->args[2]->loc, "third argument to tree_reduce must be a lambda")};
+        }
+        auto* lam = static_cast<LambdaExpr*>(expr->args[2].get());
+        if (lam->params.size() != 2) {
+            throw SemaException{error(ErrorCode::E303, lam->loc, "tree_reduce lambda must take 2 parameters (left, right), got " + std::to_string(lam->params.size()))};
+        }
+
+        for (const auto& p : lam->params) {
+            if (declared_stage_names_.find(p) != declared_stage_names_.end()) {
+                throw SemaException{error(ErrorCode::E403, lam->loc, "lambda parameter '" + p + "' shadows stage name")};
+            }
+        }
+        if (lam->params[0] == lam->params[1]) {
+            throw SemaException{error(ErrorCode::E403, lam->loc, "duplicate lambda parameter '" + lam->params[0] + "'")};
+        }
+
+        auto saved_params = local_params_;
+        local_params_[lam->params[0]] = Symbol{lam->params[0], SymbolKind::PARAM, elem_type, lam->loc};
+        local_params_[lam->params[1]] = Symbol{lam->params[1], SymbolKind::PARAM, elem_type, lam->loc};
+        TypePtr ret_type = check_expr(lam->body.get());
+        local_params_ = saved_params;
+
+        if (!types_equal(elem_type, ret_type)) {
+            throw SemaException{error(ErrorCode::E301, lam->body->loc,
+                "tree_reduce lambda return type mismatch: expected " + elem_type->to_string() + ", got " + ret_type->to_string())};
+        }
+
+        typed_prog_.lambda_param_types[lam] = {elem_type, elem_type};
+        typed_prog_.expr_types[lam] = ret_type;
+        return elem_type;
     }
 
     if (name == "join") {

@@ -7,8 +7,9 @@ const char* node_kind_to_string(NodeKind kind) {
         case NodeKind::INPUT:  return "INPUT";
         case NodeKind::MAP:    return "MAP";
         case NodeKind::FILTER: return "FILTER";
-        case NodeKind::REDUCE: return "REDUCE";
-        case NodeKind::JOIN:   return "JOIN";
+        case NodeKind::REDUCE:      return "REDUCE";
+        case NodeKind::TREE_REDUCE: return "TREE_REDUCE";
+        case NodeKind::JOIN:        return "JOIN";
         case NodeKind::SCALAR: return "SCALAR";
         case NodeKind::OUTPUT: return "OUTPUT";
     }
@@ -33,6 +34,11 @@ size_t Memo::bytes() const {
     // Join entries: JoinPairKey (16) + JoinMemoEntry (~56 bytes + hash table node overhead)
     total += join_memo.size() * (sizeof(JoinPairKey) + sizeof(JoinMemoEntry) + 32);
     if (reduce_memo.valid) total += sizeof(ReduceMemoEntry);
+    if (tree_reduce_memo.valid) {
+        total += sizeof(TreeReduceMemo) +
+                 tree_reduce_memo.tree.capacity() * sizeof(Value) +
+                 tree_reduce_memo.record_to_leaf.size() * (sizeof(RecordId) + sizeof(size_t) + 32);
+    }
     if (scalar_memo.valid) total += sizeof(ScalarMemoEntry);
     return total;
 }

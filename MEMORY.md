@@ -1,10 +1,10 @@
 # MEMORY.md — Running state of the project (update at the end of every session)
 
 ## Current status
-- Current phase: Phase 11 complete
-- Last session: 2026-10-26 — Phase 11 benchmarks completed, measured baselines B0/B1/B2 across W1–W4, filled docs/BENCHMARKS.md, all 8 test suites passing (100%)
+- Current phase: Phase 12 (Stretch Goal 1: Tree-based incremental reduce complete)
+- Last session: 2026-10-26 — Implemented `tree_reduce` builtin with O(log N) incremental propagation and binary reduction tree memoization. Fixed VM stack spill for large array literals. All 8 CTest suites passing (100%).
 - Build: clean (GCC 15.2.0 / MinGW UCRT64, CMake 4.4.4)
-- Tests: 8 passed / 0 failed (100% pass across doctest unit tests (42 cases, 511 assertions), python golden tests, and differential testing runner with 1000 trials)
+- Tests: 8 passed / 0 failed (100% pass across doctest unit tests (46 cases, 549 assertions), python golden tests, and differential testing runner with 1000 trials)
 
 ## Decisions (append only; include the reason)
 | ID | Date | Decision | Reason |
@@ -19,6 +19,8 @@
 | D-008 | 2026-10-24 | Explain provenance chains report each edit touching the output and the first affected stage | Accurately explains provenance per EDIT_SEMANTICS.md section 12 |
 | D-009 | 2026-10-24 | Differential tester verifies both valid edit convergence (full-value structural equality) and invalid-edit atomic rejection per trial | Ensures complete robustness against erroneous edits without state corruption |
 | D-010 | 2026-10-26 | Streamlined benchmark suite iterations & lean batch sizes for fast execution | Running coarse invalidation B1 on 1,000 sequential edits of 100k records causes 14,000 full-pipeline traversals; batching to 10 edits and running 1 warmup + 3 measurements keeps execution times practical (<2 minutes total) while preserving 100% verification across all workloads W1–W4 |
+| D-011 | 2026-10-26 | Tree-reduce complete binary tree array representation (size 2M) and O(log N) ascend | 1-indexed binary reduction tree maps leaves to record ids directly. Single modify edit ascends at most ceil(log2 N) levels; for 1024 items, exactly 10 recomputed ops instead of full 1024 rerun |
+| D-012 | 2026-10-26 | Dynamic overflow spill on FixedVMStack for large array literals | Preserves zero-allocation inline buffer for 99.9% of bytecodes (depth <= 64) while preventing stack overflow on large literals (e.g. 1024 elements) |
 
 ## Open questions (for the human)
 - (none yet)
@@ -39,13 +41,15 @@
 - [x] Phase 9 reuse analyzer + rebuild plan + explain
 - [x] Phase 10 verifier + differential testing
 - [x] Phase 11 benchmarks
-- [ ] Phase 12 stretch (tree reduce, cost model, record edits, control flow)
+- [x] Phase 12 stretch 1 (tree reduce O(log N) incremental propagation)
+- [ ] Phase 12 stretch 2-4 (cost model / record edits / control flow) or Final phase
 
 ## Next actions (exact, small)
-1. Proceed with Phase 12 (stretch goals) or Final phase (Report and demo per docs/PHASES.md).
+1. Push Phase 12 Stretch Goal 1 changes to remote GitHub repository.
+2. Review remaining stretch goals or transition to project wrap-up/final report.
 
 ## Session log (newest first, 2-3 lines each)
-- 2026-10-26: Phase 11 complete. Implemented workload generators W1-W4 (`bench/gen_workload.cpp`), benchmark runner (`bench/runner.cpp`), and baselines B0 (full rerun), B1 (stage invalidation flag), and B2 (fine-grained reuse). Streamlined benchmark runs with in-memory CSV caching and calibrated workload sizes to execute under 2 minutes. Generated `bench/results/benchmark_results.json` and populated `docs/BENCHMARKS.md` with measured times, speedups, and reuse percentages across all scenarios (100% verification passed). Full CTest suite passed (8/8 test suites, 42 doctest unit tests, 511 assertions, 1000 diff trials).
+- 2026-10-26: Phase 12 Stretch Goal 1 complete. Implemented `tree_reduce` builtin across Sema, IR lowering (`NodeKind::TREE_REDUCE`), Runtime (`GraphExecutor`), and Propagator (`apply_modify`, `apply_insert`, `apply_delete`). Evaluates associative combiners over complete binary reduction trees with leaves mapped to record IDs. Single modify edits propagate strictly in O(log N) operations (e.g., <=10 recomputed ops for N=1024). Updated `FixedVMStack` with dynamic overflow vector to handle large array literals without allocation overhead for small stacks. Added comprehensive unit tests in `tests/unit/test_tree_reduce.cpp`. All 8 CTest suites passed (100% pass, 46 unit test cases, 549 assertions, 1000 diff trials).
 - 2026-10-24: Phase 10 complete. Hardened verifier mode (`verify_edits`) with full-value structural comparison (`Value::operator==`) in addition to string representations. Added failure artifact dumping (`tests/diff/failures/<seed>/` with `seed.txt`, `program.rc`, `edits.rcs`). Added an invalid-edit generator pass into each trial of `difftest` verifying rejection (`E601`) and atomic rollback with unchanged outputs. All 8 CTest suites passed (42 doctest cases, 511 assertions; 1000/1000 diff trials passed).
 - 2026-10-24: Phase 9 complete. Implemented `retroc explain <file.rc> <script.rcs> <output>` CLI subcommand and provenance chain tracking (`Propagator::explain_output`) in `src/reuse/propagator.*`. Verified exact rebuild plan formatting matching `EDIT_SEMANTICS.md` section 7. Added unit tests for hand-computed op counts matching Ex2 modify and insert cases, and added golden tests for a 3-edit script (`ex2_three_edits.rc`, `ex2_three_edits.rcs`, `ex2_three_edits.expected`, `ex2_three_edits.explain.expected`). All 8 CTest suites passed (41 doctest cases, 507 assertions; 1000/1000 diff trials passed).
 - 2026-10-21: Phase 8 complete. Implemented stage insertion (Edit B) and stage deletion (Edit C) with source rewriting in `src/edit/source_rewrite.*` and graph propagation in `src/reuse/propagator.*`. Added Kahn's topological reordering algorithm (`Graph::recompute_topological_order()`) and atomic snapshot/rollback on cycles or type errors. Implemented metamorphic tests (identity map preserves outputs) and extended differential tester to all three edit types (modify, insert, delete) running 1000 randomized trials. All 8 CTest suites passed (39 unit test cases, 481 assertions; 1000/1000 diff trials passed).

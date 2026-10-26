@@ -301,24 +301,37 @@ namespace {
 struct FixedVMStack {
     Value buf[64];
     size_t sz = 0;
+    std::vector<Value> overflow;
 
     void push_back(Value v) {
         if (sz < 64) {
             buf[sz++] = std::move(v);
         } else {
-            throw RuntimeError("VM stack overflow");
+            overflow.push_back(std::move(v));
+            sz++;
         }
     }
 
     void pop_back() {
-        if (sz > 0) --sz;
+        if (sz > 64) {
+            overflow.pop_back();
+            --sz;
+        } else if (sz > 0) {
+            --sz;
+        }
     }
 
     Value& back() {
+        if (sz > 64) {
+            return overflow.back();
+        }
         return buf[sz - 1];
     }
 
     const Value& back() const {
+        if (sz > 64) {
+            return overflow.back();
+        }
         return buf[sz - 1];
     }
 

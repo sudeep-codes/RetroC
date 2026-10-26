@@ -229,6 +229,113 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
             break;
         }
 
+        case NodeKind::TREE_REDUCE: {
+            const auto& input_res = results_[node.inputs[0]];
+            res.is_collection = false;
+
+            uint64_t input_hash = input_res.as_value().hash();
+            uint64_t init_hash = node.init ? hash_expr_ir(node.init.get()) : 0;
+
+            if (enable_memo_ && node.memo.tree_reduce_memo.valid &&
+                node.memo.tree_reduce_memo.inputHash == input_hash &&
+                node.memo.tree_reduce_memo.fnHash == node.fnHash &&
+                node.memo.tree_reduce_memo.initHash == init_hash) {
+                entry.ops_reused += node.memo.tree_reduce_memo.num_leaves > 0 ? (node.memo.tree_reduce_memo.num_leaves - 1) : 1;
+                res.scalar_val = node.memo.tree_reduce_memo.result;
+                break;
+            }
+
+            BytecodeCompiler init_comp;
+            auto init_prog = init_comp.compile(node.init.get());
+            Value init_val = VM::execute(init_prog, {}, stage_values_);
+
+            const auto& col = input_res.collection_val;
+            size_t n = col.size();
+
+            if (n == 0) {
+                res.scalar_val = init_val;
+                if (enable_memo_) {
+                    TreeReduceMemo memo;
+                    memo.inputHash = input_hash;
+                    memo.fnHash = node.fnHash;
+                    memo.initHash = init_hash;
+                    memo.result = init_val;
+                    memo.valid = true;
+                    node.memo.tree_reduce_memo = std::move(memo);
+                }
+                break;
+            }
+
+            BytecodeCompiler fn_comp(node.fn->params);
+            auto fn_prog = fn_comp.compile(node.fn->body.get());
+
+            if (n == 1) {
+                entry.ops_recomputed += 1;
+                Value out = VM::execute(fn_prog, {init_val, col[0].value}, stage_values_);
+                res.scalar_val = out;
+                if (enable_memo_) {
+                    TreeReduceMemo memo;
+                    memo.tree = {Value(), out};
+                    memo.active = {false, true};
+                    memo.record_to_leaf[col[0].id] = 1;
+                    memo.leaf_offset = 1;
+                    memo.num_leaves = 1;
+                    memo.inputHash = input_hash;
+                    memo.fnHash = node.fnHash;
+                    memo.initHash = init_hash;
+                    memo.result = out;
+                    memo.valid = true;
+                    node.memo.tree_reduce_memo = std::move(memo);
+                }
+                break;
+            }
+
+            size_t m = 1;
+            while (m < n) m <<= 1;
+
+            TreeReduceMemo memo;
+            memo.leaf_offset = m;
+            memo.num_leaves = n;
+            memo.tree.resize(2 * m);
+            memo.active.resize(2 * m, false);
+
+            for (size_t i = 0; i < n; ++i) {
+                size_t leaf_idx = m + i;
+                memo.tree[leaf_idx] = col[i].value;
+                memo.active[leaf_idx] = true;
+                memo.record_to_leaf[col[i].id] = leaf_idx;
+            }
+
+            for (size_t i = m - 1; i >= 1; --i) {
+                size_t left_child = 2 * i;
+                size_t right_child = 2 * i + 1;
+                if (memo.active[left_child] && memo.active[right_child]) {
+                    entry.ops_recomputed += 1;
+                    memo.tree[i] = VM::execute(fn_prog, {memo.tree[left_child], memo.tree[right_child]}, stage_values_);
+                    memo.active[i] = true;
+                } else if (memo.active[left_child]) {
+                    memo.tree[i] = memo.tree[left_child];
+                    memo.active[i] = true;
+                } else if (memo.active[right_child]) {
+                    memo.tree[i] = memo.tree[right_child];
+                    memo.active[i] = true;
+                } else {
+                    memo.active[i] = false;
+                }
+            }
+
+            res.scalar_val = memo.tree[1];
+            if (enable_memo_) {
+                memo.inputHash = input_hash;
+                memo.fnHash = node.fnHash;
+                memo.initHash = init_hash;
+                memo.result = memo.tree[1];
+                memo.valid = true;
+                node.memo.tree_reduce_memo = std::move(memo);
+            }
+            break;
+        }
+
         case NodeKind::JOIN: {
             // JOIN: 2 input collections, left key lambda, right key lambda
             // Output ordered by left order, then right order

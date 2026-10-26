@@ -9,7 +9,7 @@ namespace retroc {
 namespace {
 
 bool is_collection_builtin(const std::string& name) {
-    return name == "filter" || name == "map" || name == "reduce" || name == "join";
+    return name == "filter" || name == "map" || name == "reduce" || name == "tree_reduce" || name == "join";
 }
 
 const CallExpr* as_collection_builtin_call(const Expr* expr) {
@@ -353,6 +353,41 @@ std::string IRBuilder::lower_stage_expression(const std::string& target_stage_na
         node.id = nid;
         node.name = target_stage_name;
         node.kind = NodeKind::REDUCE;
+        node.inputs = {stage_to_node_.at(input_stage_name)};
+
+        std::unordered_map<std::string, const ExprIR*> empty_subst;
+        node.init = lower_expr(call->args[1].get(), empty_subst);
+
+        auto* lam = static_cast<const LambdaExpr*>(call->args[2].get());
+        node.fn = lower_lambda(lam, empty_subst);
+        node.fnHash = hash_lambda_ir(*node.fn) ^ (hash_expr_ir(node.init.get()) << 1);
+
+        auto it = prog_.expr_types.find(expr);
+        node.type = (it != prog_.expr_types.end()) ? it->second : nullptr;
+
+        graph_.nodes[nid] = std::move(node);
+        graph_.order.push_back(nid);
+        stage_to_node_[target_stage_name] = nid;
+        return target_stage_name;
+    }
+
+    if (bname == "tree_reduce") {
+        // tree_reduce(c, init, f)
+        std::string input_stage_name;
+        if (as_collection_builtin_call(call->args[0].get())) {
+            hidden_stage_counter_++;
+            std::string hidden_name = "s$" + std::to_string(hidden_stage_counter_);
+            input_stage_name = lower_stage_expression(hidden_name, call->args[0].get(), nullptr);
+        } else {
+            assert(call->args[0]->kind == ExprKind::IDENT);
+            input_stage_name = static_cast<const IdentExpr*>(call->args[0].get())->name;
+        }
+
+        NodeId nid = allocate_node_id();
+        Node node;
+        node.id = nid;
+        node.name = target_stage_name;
+        node.kind = NodeKind::TREE_REDUCE;
         node.inputs = {stage_to_node_.at(input_stage_name)};
 
         std::unordered_map<std::string, const ExprIR*> empty_subst;

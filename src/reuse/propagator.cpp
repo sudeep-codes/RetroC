@@ -426,6 +426,165 @@ std::variant<RebuildPlan, CompileError> Propagator::apply_modify(const ModifyEdi
                 break;
             }
 
+            case NodeKind::TREE_REDUCE: {
+                const auto& in_res = results[node->inputs[0]];
+                res.is_collection = false;
+                sp.ops_total = in_res.collection_val.size();
+
+                uint64_t in_hash = in_res.as_value().hash();
+                uint64_t init_hash = node->init ? hash_expr_ir(node->init.get()) : 0;
+
+                auto& memo = node->memo.tree_reduce_memo;
+                const auto& changed_recs = pending_records[node_id];
+
+                bool can_incremental = (executor_.enable_memo() && memo.valid &&
+                                        memo.fnHash == node->fnHash && memo.initHash == init_hash &&
+                                        memo.num_leaves == in_res.collection_val.size() &&
+                                        !changed_recs.empty());
+
+                if (can_incremental && in_res.collection_val.size() > 1) {
+                    BytecodeCompiler fn_comp(node->fn->params);
+                    auto fn_prog = fn_comp.compile(node->fn->body.get());
+
+                    std::unordered_set<size_t> dirty_nodes_at_level;
+
+                    for (auto rid : changed_recs) {
+                        auto leaf_it = memo.record_to_leaf.find(rid);
+                        if (leaf_it == memo.record_to_leaf.end()) continue;
+                        size_t leaf_idx = leaf_it->second;
+
+                        const Value* new_val_ptr = nullptr;
+                        for (const auto& it : in_res.collection_val) {
+                            if (it.id == rid) {
+                                new_val_ptr = &it.value;
+                                break;
+                            }
+                        }
+                        if (new_val_ptr) {
+                            memo.tree[leaf_idx] = *new_val_ptr;
+                            if (leaf_idx > 1) {
+                                dirty_nodes_at_level.insert(leaf_idx / 2);
+                            }
+                        }
+                    }
+
+                    while (!dirty_nodes_at_level.empty()) {
+                        std::unordered_set<size_t> next_level;
+                        for (size_t idx : dirty_nodes_at_level) {
+                            size_t left_child = 2 * idx;
+                            size_t right_child = 2 * idx + 1;
+                            if (memo.active[left_child] && memo.active[right_child]) {
+                                sp.ops_evaluated++;
+                                hist_entry.ops_recomputed++;
+                                memo.tree[idx] = VM::execute(fn_prog, {memo.tree[left_child], memo.tree[right_child]}, stage_values);
+                                memo.active[idx] = true;
+                            } else if (memo.active[left_child]) {
+                                memo.tree[idx] = memo.tree[left_child];
+                                memo.active[idx] = true;
+                            } else if (memo.active[right_child]) {
+                                memo.tree[idx] = memo.tree[right_child];
+                                memo.active[idx] = true;
+                            }
+                            if (idx > 1) {
+                                next_level.insert(idx / 2);
+                            }
+                        }
+                        dirty_nodes_at_level = std::move(next_level);
+                    }
+
+                    sp.ops_reused = sp.ops_total > sp.ops_evaluated ? (sp.ops_total - sp.ops_evaluated) : 0;
+                    hist_entry.ops_reused += sp.ops_reused;
+                    sp.status = StagePlanStatus::PARTIAL;
+                    sp.note = "(tree_reduce O(log n) update)";
+                    memo.result = memo.tree[1];
+                    memo.inputHash = in_hash;
+                    res.scalar_val = memo.tree[1];
+                } else {
+                    BytecodeCompiler init_comp;
+                    auto init_prog = init_comp.compile(node->init.get());
+                    Value init_val = VM::execute(init_prog, {}, stage_values);
+
+                    const auto& col = in_res.collection_val;
+                    size_t n = col.size();
+
+                    if (n == 0) {
+                        res.scalar_val = init_val;
+                        sp.status = StagePlanStatus::FULL;
+                    } else if (n == 1) {
+                        sp.ops_evaluated = 1;
+                        hist_entry.ops_recomputed += 1;
+                        BytecodeCompiler fn_comp(node->fn->params);
+                        auto fn_prog = fn_comp.compile(node->fn->body.get());
+                        Value out = VM::execute(fn_prog, {init_val, col[0].value}, stage_values);
+                        res.scalar_val = out;
+                        sp.status = StagePlanStatus::FULL;
+                    } else {
+                        sp.ops_evaluated = n - 1;
+                        hist_entry.ops_recomputed += n - 1;
+                        sp.status = StagePlanStatus::FULL;
+
+                        BytecodeCompiler fn_comp(node->fn->params);
+                        auto fn_prog = fn_comp.compile(node->fn->body.get());
+
+                        size_t m = 1;
+                        while (m < n) m <<= 1;
+
+                        memo.leaf_offset = m;
+                        memo.num_leaves = n;
+                        memo.tree.resize(2 * m);
+                        memo.active.resize(2 * m, false);
+                        memo.record_to_leaf.clear();
+
+                        for (size_t i = 0; i < n; ++i) {
+                            size_t leaf_idx = m + i;
+                            memo.tree[leaf_idx] = col[i].value;
+                            memo.active[leaf_idx] = true;
+                            memo.record_to_leaf[col[i].id] = leaf_idx;
+                        }
+
+                        for (size_t i = m - 1; i >= 1; --i) {
+                            size_t left_child = 2 * i;
+                            size_t right_child = 2 * i + 1;
+                            if (memo.active[left_child] && memo.active[right_child]) {
+                                memo.tree[i] = VM::execute(fn_prog, {memo.tree[left_child], memo.tree[right_child]}, stage_values);
+                                memo.active[i] = true;
+                            } else if (memo.active[left_child]) {
+                                memo.tree[i] = memo.tree[left_child];
+                                memo.active[i] = true;
+                            } else if (memo.active[right_child]) {
+                                memo.tree[i] = memo.tree[right_child];
+                                memo.active[i] = true;
+                            } else {
+                                memo.active[i] = false;
+                            }
+                        }
+
+                        res.scalar_val = memo.tree[1];
+                        memo.result = memo.tree[1];
+                        memo.inputHash = in_hash;
+                        memo.fnHash = node->fnHash;
+                        memo.initHash = init_hash;
+                        memo.valid = true;
+                    }
+                }
+
+                uint64_t new_out_hash = res.as_value().hash();
+                if (new_out_hash != prev_out_hash) {
+                    node->version++;
+                    node->outHash = new_out_hash;
+                    for (const auto& down_id : graph_.order) {
+                        const auto* down_node = graph_.get_node(down_id);
+                        if (!down_node) continue;
+                        for (const auto& in_id : down_node->inputs) {
+                            if (in_id == node->id) {
+                                dirty_nodes.insert(down_id);
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+
             case NodeKind::JOIN: {
                 const auto& left_res = results[node->inputs[0]];
                 const auto& right_res = results[node->inputs[1]];
@@ -993,6 +1152,160 @@ std::variant<RebuildPlan, CompileError> Propagator::apply_insert(const InsertEdi
                     }
                 }
             }
+        } else if (node->kind == NodeKind::TREE_REDUCE) {
+            const auto& in_res = results[node->inputs[0]];
+            res.is_collection = false;
+            sp.ops_total = in_res.collection_val.size();
+
+            uint64_t in_hash = in_res.as_value().hash();
+            uint64_t init_hash = node->init ? hash_expr_ir(node->init.get()) : 0;
+
+            auto& memo = node->memo.tree_reduce_memo;
+            const auto& changed_recs = pending_records[node_id];
+
+            bool can_incremental = (executor_.enable_memo() && memo.valid &&
+                                    memo.fnHash == node->fnHash && memo.initHash == init_hash &&
+                                    memo.num_leaves == in_res.collection_val.size() &&
+                                    !changed_recs.empty());
+
+            if (can_incremental && in_res.collection_val.size() > 1) {
+                BytecodeCompiler fn_comp(node->fn->params);
+                auto fn_prog = fn_comp.compile(node->fn->body.get());
+
+                std::unordered_set<size_t> dirty_nodes_at_level;
+
+                for (auto rid : changed_recs) {
+                    auto leaf_it = memo.record_to_leaf.find(rid);
+                    if (leaf_it == memo.record_to_leaf.end()) continue;
+                    size_t leaf_idx = leaf_it->second;
+
+                    const Value* new_val_ptr = nullptr;
+                    for (const auto& it : in_res.collection_val) {
+                        if (it.id == rid) {
+                            new_val_ptr = &it.value;
+                            break;
+                        }
+                    }
+                    if (new_val_ptr) {
+                        memo.tree[leaf_idx] = *new_val_ptr;
+                        if (leaf_idx > 1) {
+                            dirty_nodes_at_level.insert(leaf_idx / 2);
+                        }
+                    }
+                }
+
+                while (!dirty_nodes_at_level.empty()) {
+                    std::unordered_set<size_t> next_level;
+                    for (size_t idx : dirty_nodes_at_level) {
+                        size_t left_child = 2 * idx;
+                        size_t right_child = 2 * idx + 1;
+                        if (memo.active[left_child] && memo.active[right_child]) {
+                            sp.ops_evaluated++;
+                            hist_entry.ops_recomputed++;
+                            memo.tree[idx] = VM::execute(fn_prog, {memo.tree[left_child], memo.tree[right_child]}, stage_values);
+                            memo.active[idx] = true;
+                        } else if (memo.active[left_child]) {
+                            memo.tree[idx] = memo.tree[left_child];
+                            memo.active[idx] = true;
+                        } else if (memo.active[right_child]) {
+                            memo.tree[idx] = memo.tree[right_child];
+                            memo.active[idx] = true;
+                        }
+                        if (idx > 1) {
+                            next_level.insert(idx / 2);
+                        }
+                    }
+                    dirty_nodes_at_level = std::move(next_level);
+                }
+
+                sp.ops_reused = sp.ops_total > sp.ops_evaluated ? (sp.ops_total - sp.ops_evaluated) : 0;
+                hist_entry.ops_reused += sp.ops_reused;
+                sp.status = StagePlanStatus::PARTIAL;
+                sp.note = "(tree_reduce O(log n) update)";
+                memo.result = memo.tree[1];
+                memo.inputHash = in_hash;
+                res.scalar_val = memo.tree[1];
+            } else {
+                BytecodeCompiler init_comp;
+                auto init_prog = init_comp.compile(node->init.get());
+                Value init_val = VM::execute(init_prog, {}, stage_values);
+
+                const auto& col = in_res.collection_val;
+                size_t n = col.size();
+
+                if (n == 0) {
+                    res.scalar_val = init_val;
+                    sp.status = StagePlanStatus::FULL;
+                } else if (n == 1) {
+                    sp.ops_evaluated = 1;
+                    hist_entry.ops_recomputed += 1;
+                    BytecodeCompiler fn_comp(node->fn->params);
+                    auto fn_prog = fn_comp.compile(node->fn->body.get());
+                    Value out = VM::execute(fn_prog, {init_val, col[0].value}, stage_values);
+                    res.scalar_val = out;
+                    sp.status = StagePlanStatus::FULL;
+                } else {
+                    sp.ops_evaluated = n - 1;
+                    hist_entry.ops_recomputed += n - 1;
+                    sp.status = StagePlanStatus::FULL;
+
+                    BytecodeCompiler fn_comp(node->fn->params);
+                    auto fn_prog = fn_comp.compile(node->fn->body.get());
+
+                    size_t m = 1;
+                    while (m < n) m <<= 1;
+
+                    memo.leaf_offset = m;
+                    memo.num_leaves = n;
+                    memo.tree.resize(2 * m);
+                    memo.active.resize(2 * m, false);
+                    memo.record_to_leaf.clear();
+
+                    for (size_t i = 0; i < n; ++i) {
+                        size_t leaf_idx = m + i;
+                        memo.tree[leaf_idx] = col[i].value;
+                        memo.active[leaf_idx] = true;
+                        memo.record_to_leaf[col[i].id] = leaf_idx;
+                    }
+
+                    for (size_t i = m - 1; i >= 1; --i) {
+                        size_t left_child = 2 * i;
+                        size_t right_child = 2 * i + 1;
+                        if (memo.active[left_child] && memo.active[right_child]) {
+                            memo.tree[i] = VM::execute(fn_prog, {memo.tree[left_child], memo.tree[right_child]}, stage_values);
+                            memo.active[i] = true;
+                        } else if (memo.active[left_child]) {
+                            memo.tree[i] = memo.tree[left_child];
+                            memo.active[i] = true;
+                        } else if (memo.active[right_child]) {
+                            memo.tree[i] = memo.tree[right_child];
+                            memo.active[i] = true;
+                        } else {
+                            memo.active[i] = false;
+                        }
+                    }
+
+                    res.scalar_val = memo.tree[1];
+                    memo.result = memo.tree[1];
+                    memo.inputHash = in_hash;
+                    memo.fnHash = node->fnHash;
+                    memo.initHash = init_hash;
+                    memo.valid = true;
+                }
+            }
+
+            uint64_t new_out_hash = res.as_value().hash();
+            if (new_out_hash != prev_out_hash) {
+                node->version++;
+                node->outHash = new_out_hash;
+                for (const auto& down_id : graph_.order) {
+                    const auto* down_node = graph_.get_node(down_id);
+                    if (!down_node) continue;
+                    for (const auto& in_id : down_node->inputs) {
+                        if (in_id == node->id) dirty_nodes.insert(down_id);
+                    }
+                }
+            }
         } else if (node->kind == NodeKind::SCALAR) {
             res.is_collection = false;
             sp.ops_total = 1;
@@ -1380,6 +1693,160 @@ std::variant<RebuildPlan, CompileError> Propagator::apply_delete(const DeleteEdi
                 res.scalar_val = acc;
                 if (executor_.enable_memo()) {
                     node->memo.reduce_memo = ReduceMemoEntry{in_hash, node->fnHash, init_hash, acc, true};
+                }
+            }
+
+            uint64_t new_out_hash = res.as_value().hash();
+            if (new_out_hash != prev_out_hash) {
+                node->version++;
+                node->outHash = new_out_hash;
+                for (const auto& down_id : graph_.order) {
+                    const auto* down_node = graph_.get_node(down_id);
+                    if (!down_node) continue;
+                    for (const auto& in_id : down_node->inputs) {
+                        if (in_id == node->id) dirty_nodes.insert(down_id);
+                    }
+                }
+            }
+        } else if (node->kind == NodeKind::TREE_REDUCE) {
+            const auto& in_res = results[node->inputs[0]];
+            res.is_collection = false;
+            sp.ops_total = in_res.collection_val.size();
+
+            uint64_t in_hash = in_res.as_value().hash();
+            uint64_t init_hash = node->init ? hash_expr_ir(node->init.get()) : 0;
+
+            auto& memo = node->memo.tree_reduce_memo;
+            const auto& changed_recs = pending_records[node_id];
+
+            bool can_incremental = (executor_.enable_memo() && memo.valid &&
+                                    memo.fnHash == node->fnHash && memo.initHash == init_hash &&
+                                    memo.num_leaves == in_res.collection_val.size() &&
+                                    !changed_recs.empty());
+
+            if (can_incremental && in_res.collection_val.size() > 1) {
+                BytecodeCompiler fn_comp(node->fn->params);
+                auto fn_prog = fn_comp.compile(node->fn->body.get());
+
+                std::unordered_set<size_t> dirty_nodes_at_level;
+
+                for (auto rid : changed_recs) {
+                    auto leaf_it = memo.record_to_leaf.find(rid);
+                    if (leaf_it == memo.record_to_leaf.end()) continue;
+                    size_t leaf_idx = leaf_it->second;
+
+                    const Value* new_val_ptr = nullptr;
+                    for (const auto& it : in_res.collection_val) {
+                        if (it.id == rid) {
+                            new_val_ptr = &it.value;
+                            break;
+                        }
+                    }
+                    if (new_val_ptr) {
+                        memo.tree[leaf_idx] = *new_val_ptr;
+                        if (leaf_idx > 1) {
+                            dirty_nodes_at_level.insert(leaf_idx / 2);
+                        }
+                    }
+                }
+
+                while (!dirty_nodes_at_level.empty()) {
+                    std::unordered_set<size_t> next_level;
+                    for (size_t idx : dirty_nodes_at_level) {
+                        size_t left_child = 2 * idx;
+                        size_t right_child = 2 * idx + 1;
+                        if (memo.active[left_child] && memo.active[right_child]) {
+                            sp.ops_evaluated++;
+                            hist_entry.ops_recomputed++;
+                            memo.tree[idx] = VM::execute(fn_prog, {memo.tree[left_child], memo.tree[right_child]}, stage_values);
+                            memo.active[idx] = true;
+                        } else if (memo.active[left_child]) {
+                            memo.tree[idx] = memo.tree[left_child];
+                            memo.active[idx] = true;
+                        } else if (memo.active[right_child]) {
+                            memo.tree[idx] = memo.tree[right_child];
+                            memo.active[idx] = true;
+                        }
+                        if (idx > 1) {
+                            next_level.insert(idx / 2);
+                        }
+                    }
+                    dirty_nodes_at_level = std::move(next_level);
+                }
+
+                sp.ops_reused = sp.ops_total > sp.ops_evaluated ? (sp.ops_total - sp.ops_evaluated) : 0;
+                hist_entry.ops_reused += sp.ops_reused;
+                sp.status = StagePlanStatus::PARTIAL;
+                sp.note = "(tree_reduce O(log n) update)";
+                memo.result = memo.tree[1];
+                memo.inputHash = in_hash;
+                res.scalar_val = memo.tree[1];
+            } else {
+                BytecodeCompiler init_comp;
+                auto init_prog = init_comp.compile(node->init.get());
+                Value init_val = VM::execute(init_prog, {}, stage_values);
+
+                const auto& col = in_res.collection_val;
+                size_t n = col.size();
+
+                if (n == 0) {
+                    res.scalar_val = init_val;
+                    sp.status = StagePlanStatus::FULL;
+                } else if (n == 1) {
+                    sp.ops_evaluated = 1;
+                    hist_entry.ops_recomputed += 1;
+                    BytecodeCompiler fn_comp(node->fn->params);
+                    auto fn_prog = fn_comp.compile(node->fn->body.get());
+                    Value out = VM::execute(fn_prog, {init_val, col[0].value}, stage_values);
+                    res.scalar_val = out;
+                    sp.status = StagePlanStatus::FULL;
+                } else {
+                    sp.ops_evaluated = n - 1;
+                    hist_entry.ops_recomputed += n - 1;
+                    sp.status = StagePlanStatus::FULL;
+
+                    BytecodeCompiler fn_comp(node->fn->params);
+                    auto fn_prog = fn_comp.compile(node->fn->body.get());
+
+                    size_t m = 1;
+                    while (m < n) m <<= 1;
+
+                    memo.leaf_offset = m;
+                    memo.num_leaves = n;
+                    memo.tree.resize(2 * m);
+                    memo.active.resize(2 * m, false);
+                    memo.record_to_leaf.clear();
+
+                    for (size_t i = 0; i < n; ++i) {
+                        size_t leaf_idx = m + i;
+                        memo.tree[leaf_idx] = col[i].value;
+                        memo.active[leaf_idx] = true;
+                        memo.record_to_leaf[col[i].id] = leaf_idx;
+                    }
+
+                    for (size_t i = m - 1; i >= 1; --i) {
+                        size_t left_child = 2 * i;
+                        size_t right_child = 2 * i + 1;
+                        if (memo.active[left_child] && memo.active[right_child]) {
+                            memo.tree[i] = VM::execute(fn_prog, {memo.tree[left_child], memo.tree[right_child]}, stage_values);
+                            memo.active[i] = true;
+                        } else if (memo.active[left_child]) {
+                            memo.tree[i] = memo.tree[left_child];
+                            memo.active[i] = true;
+                        } else if (memo.active[right_child]) {
+                            memo.tree[i] = memo.tree[right_child];
+                            memo.active[i] = true;
+                        } else {
+                            memo.active[i] = false;
+                        }
+                    }
+
+                    res.scalar_val = memo.tree[1];
+                    memo.result = memo.tree[1];
+                    memo.inputHash = in_hash;
+                    memo.fnHash = node->fnHash;
+                    memo.initHash = init_hash;
+                    memo.valid = true;
                 }
             }
 

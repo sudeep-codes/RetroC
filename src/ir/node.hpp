@@ -18,6 +18,7 @@ enum class NodeKind {
     MAP,
     FILTER,
     REDUCE,
+    TREE_REDUCE,
     JOIN,
     SCALAR,
     OUTPUT
@@ -50,6 +51,20 @@ struct FilterMemoEntry {
 
 // REDUCE: {inputHash, fnHash, initHash, result}
 struct ReduceMemoEntry {
+    uint64_t inputHash = 0;
+    uint64_t fnHash = 0;
+    uint64_t initHash = 0;
+    Value result;
+    bool valid = false;
+};
+
+// TREE_REDUCE: complete binary reduction tree for associative combiners
+struct TreeReduceMemo {
+    std::vector<Value> tree; // 1-indexed, size 2*M, where tree[1] is root
+    std::vector<bool> active; // active[node] indicates if node has value
+    std::unordered_map<RecordId, size_t> record_to_leaf; // RecordId -> tree index (leaf)
+    size_t leaf_offset = 0; // M
+    size_t num_leaves = 0;
     uint64_t inputHash = 0;
     uint64_t fnHash = 0;
     uint64_t initHash = 0;
@@ -95,6 +110,7 @@ struct Memo {
     std::unordered_map<RecordId, MapMemoEntry> map_memo;
     std::unordered_map<RecordId, FilterMemoEntry> filter_memo;
     ReduceMemoEntry reduce_memo;
+    TreeReduceMemo tree_reduce_memo;
     ScalarMemoEntry scalar_memo;
     std::unordered_map<JoinPairKey, JoinMemoEntry, JoinPairHash> join_memo;
 
@@ -103,6 +119,7 @@ struct Memo {
         if (!map_memo.empty()) return map_memo.size();
         if (!filter_memo.empty()) return filter_memo.size();
         if (!join_memo.empty()) return join_memo.size();
+        if (tree_reduce_memo.valid) return tree_reduce_memo.tree.size();
         if (reduce_memo.valid) return 1;
         if (scalar_memo.valid) return 1;
         return 0;
@@ -112,6 +129,7 @@ struct Memo {
         map_memo.clear();
         filter_memo.clear();
         reduce_memo = ReduceMemoEntry{};
+        tree_reduce_memo = TreeReduceMemo{};
         scalar_memo = ScalarMemoEntry{};
         join_memo.clear();
     }

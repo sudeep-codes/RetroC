@@ -31,7 +31,7 @@ void dump_ir(const Graph& graph, std::ostream& out, bool verbose) {
         }
 
         // Details according to kind:
-        if (node->kind == NodeKind::REDUCE) {
+        if (node->kind == NodeKind::REDUCE || node->kind == NodeKind::TREE_REDUCE) {
             if (node->init) {
                 out << "  init: " << format_expr_ir(node->init.get());
             }
