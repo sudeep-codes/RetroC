@@ -46,18 +46,18 @@ Also run W1 at 10k and 1M to show scaling.
 ## 6. Result tables (fill from measurements)
 | Workload | Edit | B0 ms | B1 ms | B2 ms | Speedup B0/B2 | Reuse % | Verify |
 |---|---|---|---|---|---|---|---|
-| W1 | E-A | | | | | | |
-| W1 | E-B | | | | | | |
-| W1 | E-C | | | | | | |
-| W1 | E-D | | | | | | |
-| W1 | E-E | | | | | | |
-| W2 | E-A | | | | | | |
-| W3 | E-C | | | | | | |
-| W4 | E-A | | | | | | |
+| W1 | E-A | 745.69 | 555.90 | 526.70 | 1.42x | 83.2% | PASS |
+| W1 | E-B | 686.46 | 4762.16 | 4639.51 | 0.15x | 100.0% | PASS |
+| W1 | E-C | 815.34 | 1207.21 | 1173.87 | 0.69x | 0.0% | PASS |
+| W1 | E-D | 767.99 | 590.31 | 701.54 | 1.09x | 50.0% | PASS |
+| W1 | E-E | 554.50 | 661.84 | 653.24 | 0.85x | 0.5% | PASS |
+| W2 | E-A | 30.58 | 149.03 | 148.99 | 0.21x | 48.0% | PASS |
+| W3 | E-C | 2040.00 | 3942.37 | 4047.10 | 0.50x | 0.0% | PASS |
+| W4 | E-A | 186.23 | 133.24 | 122.35 | 1.52x | 50.0% | PASS |
 
 | Workload | First run plain ms | First run with history ms | Overhead | Memo MB | Input MB |
 |---|---|---|---|---|---|
-| W1 | | | | | |
+| W1 | 684.01 | 767.84 | 12.3% | 36.18 | 1.73 |
 
 ## 7. Honesty rules for the report
 - Show cases where RetroC is slower or near 1x (e.g. insert at the pipeline start that changes most records; O(n) reduce).

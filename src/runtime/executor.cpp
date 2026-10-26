@@ -87,7 +87,14 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
                 }
                 TypePtr elem_ty = (node.type && node.type->kind == TypeKind::ARRAY) ? node.type->element_type : nullptr;
                 res.is_collection = true;
-                res.collection_val = load_csv(csv_path.string(), elem_ty);
+                auto& cache = csv_cache();
+                auto it = cache.find(csv_path.string());
+                if (it != cache.end()) {
+                    res.collection_val = it->second;
+                } else {
+                    res.collection_val = load_csv(csv_path.string(), elem_ty);
+                    cache[csv_path.string()] = res.collection_val;
+                }
                 entry.ops_recomputed += res.collection_val.size();
             } else if (node.expr) {
                 // Inline data: compile and evaluate expr

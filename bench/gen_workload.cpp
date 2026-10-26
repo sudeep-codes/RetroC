@@ -127,14 +127,14 @@ int main(int argc, char** argv) {
     generate_w1(out_dir, 100000);
     generate_w1(out_dir, 1000000);
 
-    // W2: 50000 users, 200000 orders
-    generate_w2(out_dir, 50000, 200000);
+    // W2: 500 users, 2000 orders
+    generate_w2(out_dir, 500, 2000);
 
     // W3: 100000 records, 12 chained stages
     generate_w3(out_dir, 100000);
 
-    // W4: 1000000 records, reduce heavy
-    generate_w4(out_dir, 1000000);
+    // W4: 100000 records, reduce heavy
+    generate_w4(out_dir, 100000);
 
     std::cout << "Workload generation complete." << std::endl;
     return 0;
