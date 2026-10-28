@@ -56,6 +56,46 @@ std::string RebuildPlan::to_string() const {
     oss << "\n";
     return oss.str();
 }
+namespace {
+
+std::unordered_map<NodeId, std::vector<NodeId>> build_consumer_index(const Graph& graph) {
+    std::unordered_map<NodeId, std::vector<NodeId>> consumers;
+    for (const auto& node_id : graph.order) {
+        const Node* n = graph.get_node(node_id);
+        if (!n) continue;
+        for (const auto& in_id : n->inputs) {
+            auto& list = consumers[in_id];
+            if (list.empty() || list.back() != node_id) {
+                list.push_back(node_id);
+            }
+        }
+    }
+    return consumers;
+}
+
+// Collections are sorted by RecordId: inputs number records by position, MAP and
+// FILTER keep ids and order (I7), JOIN numbers its output in order. So a record
+// can be found by binary search instead of a scan.
+bool id_less(const CollectionItem& item, RecordId id) {
+    return item.id < id;
+}
+
+Collection::iterator lower_bound_id(Collection& col, RecordId id) {
+    return std::lower_bound(col.begin(), col.end(), id, id_less);
+}
+
+const CollectionItem* find_record(const Collection& col, RecordId id) {
+    auto it = std::lower_bound(col.begin(), col.end(), id, id_less);
+    return (it != col.end() && it->id == id) ? &*it : nullptr;
+}
+
+// Kinds that can consume a set of changed RecordIds instead of a full rescan
+bool tracks_records(NodeKind kind) {
+    return kind == NodeKind::MAP || kind == NodeKind::FILTER || kind == NodeKind::TREE_REDUCE;
+}
+
+} // namespace
+
 
 std::variant<RebuildPlan, CompileError> Propagator::apply_modify(const ModifyEdit& edit) {
     // 1. Precondition checks per EDIT_SEMANTICS.md section 3:
@@ -80,11 +120,9 @@ std::variant<RebuildPlan, CompileError> Propagator::apply_modify(const ModifyEdi
 
     auto& col = it_res->second.collection_val;
     CollectionItem* target_item = nullptr;
-    for (auto& item : col) {
-        if (item.id == edit.record_id) {
-            target_item = &item;
-            break;
-        }
+    auto target_it = lower_bound_id(col, edit.record_id);
+    if (target_it != col.end() && target_it->id == edit.record_id) {
+        target_item = &*target_it;
     }
 
     if (!target_item) {
@@ -143,633 +181,42 @@ std::variant<RebuildPlan, CompileError> Propagator::apply_modify(const ModifyEdi
     // EditId allocation
     EditId current_edit_id = executor_.get_history().next_edit_id++;
 
-    // Prepare RebuildPlan
     RebuildPlan plan;
     plan.edit_id = current_edit_id;
     plan.edit_description = edit.to_string();
-
-    // Check if new record value is structurally identical to old record value
-    bool value_unchanged = (old_record_val == new_record_val);
-
-    // Apply modification to target item
-    target_item->value = new_record_val;
-
-    // Recompute input node outHash
-    uint64_t old_input_hash = input_node->outHash;
-    uint64_t new_input_hash = it_res->second.as_value().hash();
-
-    // Invariant I4: version increases iff outHash changes
-    if (new_input_hash != old_input_hash) {
-        input_node->version++;
-        input_node->outHash = new_input_hash;
-    }
-    stage_values[input_node->name] = it_res->second.as_value();
-
-    // Work set: per-node pending record set
-    // Seed work set: {(input_stage, RecordId)}
-    std::unordered_map<NodeId, std::unordered_set<RecordId>> pending_records;
-    std::unordered_set<NodeId> dirty_nodes;
-
-    if (!value_unchanged && new_input_hash != old_input_hash) {
-        // Add consumers of input_node
-        for (const auto& nid : graph_.order) {
-            const auto* n = graph_.get_node(nid);
-            if (!n) continue;
-            for (const auto& in_id : n->inputs) {
-                if (in_id == input_node->id) {
-                    pending_records[nid].insert(edit.record_id);
-                    dirty_nodes.insert(nid);
-                }
-            }
-        }
-    }
 
     HistoryEntry hist_entry;
     hist_entry.edit_id = current_edit_id;
     hist_entry.description = edit.to_string();
     hist_entry.nodes_touched.push_back(input_node->name);
 
-    // 6. Propagation algorithm (topological order)
-    for (const auto& node_id : graph_.order) {
-        auto* node = graph_.get_node(node_id);
-        if (!node) continue;
-        if (node->id == input_node->id) {
-            continue; // input node already updated
-        }
-
-        bool has_pending = (pending_records.find(node_id) != pending_records.end() &&
-                            !pending_records[node_id].empty());
-        bool is_dirty = (dirty_nodes.find(node_id) != dirty_nodes.end());
-
-        if (!has_pending && !is_dirty) {
-            // Node has no pending work and no dirty inputs: early cutoff / clean
-            node->status = NodeStatus::CLEAN;
-            continue;
-        }
-
-        hist_entry.nodes_touched.push_back(node->name);
-
-        StagePlan sp;
-        sp.stage_name = node->name;
-
-        NodeExecutionResult& res = results[node_id];
-        uint64_t prev_out_hash = node->outHash;
-
-        switch (node->kind) {
-            case NodeKind::INPUT:
-                break;
-
-            case NodeKind::MAP: {
-                // node->inputs[0] is input collection
-                const auto& in_res = results[node->inputs[0]];
-                res.is_collection = true;
-                sp.ops_total = in_res.collection_val.size();
-
-                BytecodeCompiler compiler(node->fn->params);
-                auto prog = compiler.compile(node->fn->body.get());
-
-                Collection new_col;
-                new_col.reserve(in_res.collection_val.size());
-
-                std::unordered_set<RecordId> changed_records;
-
-                for (const auto& item : in_res.collection_val) {
-                    uint64_t in_hash = item.value.hash();
-                    // Invariant I3: check memo entry
-                    bool can_reuse = false;
-                    if (executor_.enable_memo()) {
-                        auto memo_it = node->memo.map_memo.find(item.id);
-                        if (memo_it != node->memo.map_memo.end() &&
-                            memo_it->second.inHash == in_hash &&
-                            memo_it->second.fnHash == node->fnHash) {
-                            can_reuse = true;
-                            sp.ops_reused++;
-                            hist_entry.ops_reused++;
-                            new_col.push_back(CollectionItem{item.id, memo_it->second.out});
-                        }
-                    }
-
-                    if (!can_reuse) {
-                        sp.ops_evaluated++;
-                        hist_entry.ops_recomputed++;
-                        Value out_val = VM::execute(prog, {item.value}, stage_values);
-                        if (executor_.enable_memo()) {
-                            node->memo.map_memo[item.id] = MapMemoEntry{in_hash, node->fnHash, out_val};
-                        }
-                        changed_records.insert(item.id);
-                        new_col.push_back(CollectionItem{item.id, std::move(out_val)});
-                    }
-                }
-
-                res.collection_val = std::move(new_col);
-
-                if (sp.ops_evaluated == 0) {
-                    sp.status = StagePlanStatus::REUSED;
-                } else if (sp.ops_evaluated == sp.ops_total) {
-                    sp.status = StagePlanStatus::FULL;
-                } else {
-                    sp.status = StagePlanStatus::PARTIAL;
-                    sp.note = "(early cutoff on unchanged inputs)";
-                }
-
-                // If output changed, mark downstream
-                uint64_t new_out_hash = res.as_value().hash();
-                if (new_out_hash != prev_out_hash) {
-                    node->version++;
-                    node->outHash = new_out_hash;
-                    // Add changed records to downstream pending sets
-                    for (const auto& down_id : graph_.order) {
-                        const auto* down_node = graph_.get_node(down_id);
-                        if (!down_node) continue;
-                        for (const auto& in_id : down_node->inputs) {
-                            if (in_id == node->id) {
-                                dirty_nodes.insert(down_id);
-                                for (auto r : changed_records) {
-                                    pending_records[down_id].insert(r);
-                                }
-                            }
-                        }
-                    }
-                }
-                break;
-            }
-
-            case NodeKind::FILTER: {
-                const auto& in_res = results[node->inputs[0]];
-                res.is_collection = true;
-                sp.ops_total = in_res.collection_val.size();
-
-                BytecodeCompiler compiler(node->fn->params);
-                auto prog = compiler.compile(node->fn->body.get());
-
-                Collection new_col;
-                std::unordered_set<RecordId> changed_records;
-
-                for (const auto& item : in_res.collection_val) {
-                    uint64_t in_hash = item.value.hash();
-                    bool keep = false;
-                    bool can_reuse = false;
-
-                    if (executor_.enable_memo()) {
-                        auto memo_it = node->memo.filter_memo.find(item.id);
-                        if (memo_it != node->memo.filter_memo.end() &&
-                            memo_it->second.inHash == in_hash &&
-                            memo_it->second.fnHash == node->fnHash) {
-                            can_reuse = true;
-                            sp.ops_reused++;
-                            hist_entry.ops_reused++;
-                            keep = memo_it->second.keep;
-                            if (keep) {
-                                new_col.push_back(item);
-                            }
-                        }
-                    }
-
-                    if (!can_reuse) {
-                        sp.ops_evaluated++;
-                        hist_entry.ops_recomputed++;
-                        Value keep_val = VM::execute(prog, {item.value}, stage_values);
-                        keep = keep_val.bool_val;
-                        if (executor_.enable_memo()) {
-                            node->memo.filter_memo[item.id] = FilterMemoEntry{in_hash, node->fnHash, keep};
-                        }
-                        changed_records.insert(item.id);
-                        if (keep) {
-                            new_col.push_back(item);
-                        }
-                    }
-                }
-
-                res.collection_val = std::move(new_col);
-
-                if (sp.ops_evaluated == 0) {
-                    sp.status = StagePlanStatus::REUSED;
-                } else if (sp.ops_evaluated == sp.ops_total) {
-                    sp.status = StagePlanStatus::FULL;
-                } else {
-                    sp.status = StagePlanStatus::PARTIAL;
-                }
-
-                uint64_t new_out_hash = res.as_value().hash();
-                if (new_out_hash != prev_out_hash) {
-                    node->version++;
-                    node->outHash = new_out_hash;
-                    for (const auto& down_id : graph_.order) {
-                        const auto* down_node = graph_.get_node(down_id);
-                        if (!down_node) continue;
-                        for (const auto& in_id : down_node->inputs) {
-                            if (in_id == node->id) {
-                                dirty_nodes.insert(down_id);
-                                for (auto r : changed_records) {
-                                    pending_records[down_id].insert(r);
-                                }
-                            }
-                        }
-                    }
-                }
-                break;
-            }
-
-            case NodeKind::REDUCE: {
-                const auto& in_res = results[node->inputs[0]];
-                res.is_collection = false;
-                sp.ops_total = in_res.collection_val.size();
-
-                uint64_t in_hash = in_res.as_value().hash();
-                uint64_t init_hash = node->init ? hash_expr_ir(node->init.get()) : 0;
-
-                if (executor_.enable_memo() && node->memo.reduce_memo.valid &&
-                    node->memo.reduce_memo.inputHash == in_hash &&
-                    node->memo.reduce_memo.fnHash == node->fnHash &&
-                    node->memo.reduce_memo.initHash == init_hash) {
-                    sp.ops_reused = sp.ops_total;
-                    hist_entry.ops_reused += sp.ops_total;
-                    sp.status = StagePlanStatus::REUSED;
-                    res.scalar_val = node->memo.reduce_memo.result;
-                } else {
-                    sp.ops_evaluated = sp.ops_total;
-                    hist_entry.ops_recomputed += sp.ops_total;
-                    sp.status = StagePlanStatus::FULL;
-                    sp.note = "(reduce is O(n) in v1)";
-
-                    BytecodeCompiler init_comp;
-                    auto init_prog = init_comp.compile(node->init.get());
-                    Value acc = VM::execute(init_prog, {}, stage_values);
-
-                    if (node->fn.has_value()) {
-                        BytecodeCompiler fn_comp(node->fn->params);
-                        auto fn_prog = fn_comp.compile(node->fn->body.get());
-                        for (const auto& item : in_res.collection_val) {
-                            acc = VM::execute(fn_prog, {acc, item.value}, stage_values);
-                        }
-                    }
-                    res.scalar_val = acc;
-                    if (executor_.enable_memo()) {
-                        node->memo.reduce_memo = ReduceMemoEntry{in_hash, node->fnHash, init_hash, acc, true};
-                    }
-                }
-
-                uint64_t new_out_hash = res.as_value().hash();
-                if (new_out_hash != prev_out_hash) {
-                    node->version++;
-                    node->outHash = new_out_hash;
-                    for (const auto& down_id : graph_.order) {
-                        const auto* down_node = graph_.get_node(down_id);
-                        if (!down_node) continue;
-                        for (const auto& in_id : down_node->inputs) {
-                            if (in_id == node->id) {
-                                dirty_nodes.insert(down_id);
-                            }
-                        }
-                    }
-                }
-                break;
-            }
-
-            case NodeKind::TREE_REDUCE: {
-                const auto& in_res = results[node->inputs[0]];
-                res.is_collection = false;
-                sp.ops_total = in_res.collection_val.size();
-
-                uint64_t in_hash = in_res.as_value().hash();
-                uint64_t init_hash = node->init ? hash_expr_ir(node->init.get()) : 0;
-
-                auto& memo = node->memo.tree_reduce_memo;
-                const auto& changed_recs = pending_records[node_id];
-
-                bool can_incremental = (executor_.enable_memo() && memo.valid &&
-                                        memo.fnHash == node->fnHash && memo.initHash == init_hash &&
-                                        memo.num_leaves == in_res.collection_val.size() &&
-                                        !changed_recs.empty());
-
-                if (can_incremental && in_res.collection_val.size() > 1) {
-                    BytecodeCompiler fn_comp(node->fn->params);
-                    auto fn_prog = fn_comp.compile(node->fn->body.get());
-
-                    std::unordered_set<size_t> dirty_nodes_at_level;
-
-                    for (auto rid : changed_recs) {
-                        auto leaf_it = memo.record_to_leaf.find(rid);
-                        if (leaf_it == memo.record_to_leaf.end()) continue;
-                        size_t leaf_idx = leaf_it->second;
-
-                        const Value* new_val_ptr = nullptr;
-                        for (const auto& it : in_res.collection_val) {
-                            if (it.id == rid) {
-                                new_val_ptr = &it.value;
-                                break;
-                            }
-                        }
-                        if (new_val_ptr) {
-                            memo.tree[leaf_idx] = *new_val_ptr;
-                            if (leaf_idx > 1) {
-                                dirty_nodes_at_level.insert(leaf_idx / 2);
-                            }
-                        }
-                    }
-
-                    while (!dirty_nodes_at_level.empty()) {
-                        std::unordered_set<size_t> next_level;
-                        for (size_t idx : dirty_nodes_at_level) {
-                            size_t left_child = 2 * idx;
-                            size_t right_child = 2 * idx + 1;
-                            if (memo.active[left_child] && memo.active[right_child]) {
-                                sp.ops_evaluated++;
-                                hist_entry.ops_recomputed++;
-                                memo.tree[idx] = VM::execute(fn_prog, {memo.tree[left_child], memo.tree[right_child]}, stage_values);
-                                memo.active[idx] = true;
-                            } else if (memo.active[left_child]) {
-                                memo.tree[idx] = memo.tree[left_child];
-                                memo.active[idx] = true;
-                            } else if (memo.active[right_child]) {
-                                memo.tree[idx] = memo.tree[right_child];
-                                memo.active[idx] = true;
-                            }
-                            if (idx > 1) {
-                                next_level.insert(idx / 2);
-                            }
-                        }
-                        dirty_nodes_at_level = std::move(next_level);
-                    }
-
-                    sp.ops_reused = sp.ops_total > sp.ops_evaluated ? (sp.ops_total - sp.ops_evaluated) : 0;
-                    hist_entry.ops_reused += sp.ops_reused;
-                    sp.status = StagePlanStatus::PARTIAL;
-                    sp.note = "(tree_reduce O(log n) update)";
-                    memo.result = memo.tree[1];
-                    memo.inputHash = in_hash;
-                    res.scalar_val = memo.tree[1];
-                } else {
-                    BytecodeCompiler init_comp;
-                    auto init_prog = init_comp.compile(node->init.get());
-                    Value init_val = VM::execute(init_prog, {}, stage_values);
-
-                    const auto& col = in_res.collection_val;
-                    size_t n = col.size();
-
-                    if (n == 0) {
-                        res.scalar_val = init_val;
-                        sp.status = StagePlanStatus::FULL;
-                    } else if (n == 1) {
-                        sp.ops_evaluated = 1;
-                        hist_entry.ops_recomputed += 1;
-                        BytecodeCompiler fn_comp(node->fn->params);
-                        auto fn_prog = fn_comp.compile(node->fn->body.get());
-                        Value out = VM::execute(fn_prog, {init_val, col[0].value}, stage_values);
-                        res.scalar_val = out;
-                        sp.status = StagePlanStatus::FULL;
-                    } else {
-                        sp.ops_evaluated = n - 1;
-                        hist_entry.ops_recomputed += n - 1;
-                        sp.status = StagePlanStatus::FULL;
-
-                        BytecodeCompiler fn_comp(node->fn->params);
-                        auto fn_prog = fn_comp.compile(node->fn->body.get());
-
-                        size_t m = 1;
-                        while (m < n) m <<= 1;
-
-                        memo.leaf_offset = m;
-                        memo.num_leaves = n;
-                        memo.tree.resize(2 * m);
-                        memo.active.resize(2 * m, false);
-                        memo.record_to_leaf.clear();
-
-                        for (size_t i = 0; i < n; ++i) {
-                            size_t leaf_idx = m + i;
-                            memo.tree[leaf_idx] = col[i].value;
-                            memo.active[leaf_idx] = true;
-                            memo.record_to_leaf[col[i].id] = leaf_idx;
-                        }
-
-                        for (size_t i = m - 1; i >= 1; --i) {
-                            size_t left_child = 2 * i;
-                            size_t right_child = 2 * i + 1;
-                            if (memo.active[left_child] && memo.active[right_child]) {
-                                memo.tree[i] = VM::execute(fn_prog, {memo.tree[left_child], memo.tree[right_child]}, stage_values);
-                                memo.active[i] = true;
-                            } else if (memo.active[left_child]) {
-                                memo.tree[i] = memo.tree[left_child];
-                                memo.active[i] = true;
-                            } else if (memo.active[right_child]) {
-                                memo.tree[i] = memo.tree[right_child];
-                                memo.active[i] = true;
-                            } else {
-                                memo.active[i] = false;
-                            }
-                        }
-
-                        res.scalar_val = memo.tree[1];
-                        memo.result = memo.tree[1];
-                        memo.inputHash = in_hash;
-                        memo.fnHash = node->fnHash;
-                        memo.initHash = init_hash;
-                        memo.valid = true;
-                    }
-                }
-
-                uint64_t new_out_hash = res.as_value().hash();
-                if (new_out_hash != prev_out_hash) {
-                    node->version++;
-                    node->outHash = new_out_hash;
-                    for (const auto& down_id : graph_.order) {
-                        const auto* down_node = graph_.get_node(down_id);
-                        if (!down_node) continue;
-                        for (const auto& in_id : down_node->inputs) {
-                            if (in_id == node->id) {
-                                dirty_nodes.insert(down_id);
-                            }
-                        }
-                    }
-                }
-                break;
-            }
-
-            case NodeKind::JOIN: {
-                const auto& left_res = results[node->inputs[0]];
-                const auto& right_res = results[node->inputs[1]];
-                res.is_collection = true;
-                sp.ops_total = left_res.collection_val.size() + right_res.collection_val.size();
-
-                uint64_t ka_hash = node->fn ? hash_lambda_ir(*node->fn) : 0;
-                uint64_t kb_hash = node->join_fn_b ? hash_lambda_ir(*node->join_fn_b) : 0;
-
-                BytecodeCompiler ka_comp(node->fn->params);
-                auto ka_prog = ka_comp.compile(node->fn->body.get());
-
-                BytecodeCompiler kb_comp(node->join_fn_b->params);
-                auto kb_prog = kb_comp.compile(node->join_fn_b->body.get());
-
-                std::vector<std::pair<Value, const CollectionItem*>> right_keys;
-                right_keys.reserve(right_res.collection_val.size());
-                for (const auto& r_item : right_res.collection_val) {
-                    Value key = VM::execute(kb_prog, {r_item.value}, stage_values);
-                    sp.ops_evaluated++;
-                    hist_entry.ops_recomputed++;
-                    right_keys.push_back({std::move(key), &r_item});
-                }
-
-                Collection new_col;
-                RecordId out_id = 0;
-                for (const auto& l_item : left_res.collection_val) {
-                    Value l_key = VM::execute(ka_prog, {l_item.value}, stage_values);
-                    sp.ops_evaluated++;
-                    hist_entry.ops_recomputed++;
-                    uint64_t l_hash = l_item.value.hash();
-
-                    for (const auto& [r_key, r_item_ptr] : right_keys) {
-                        JoinPairKey pair_key{l_item.id, r_item_ptr->id};
-                        uint64_t r_hash = r_item_ptr->value.hash();
-
-                        if (executor_.enable_memo()) {
-                            auto memo_it = node->memo.join_memo.find(pair_key);
-                            if (memo_it != node->memo.join_memo.end() &&
-                                memo_it->second.leftHash == l_hash &&
-                                memo_it->second.rightHash == r_hash &&
-                                memo_it->second.kaHash == ka_hash &&
-                                memo_it->second.kbHash == kb_hash) {
-                                if (memo_it->second.matched) {
-                                    new_col.push_back(CollectionItem{out_id++, memo_it->second.out});
-                                }
-                                continue;
-                            }
-                        }
-
-                        bool matched = (l_key == r_key);
-                        Value out_record;
-                        if (matched) {
-                            std::vector<RecordField> fields = {
-                                {"left", std::make_shared<Value>(l_item.value)},
-                                {"right", std::make_shared<Value>(r_item_ptr->value)}
-                            };
-                            out_record = Value::make_record(std::move(fields));
-                            new_col.push_back(CollectionItem{out_id++, out_record});
-                        }
-                        if (executor_.enable_memo()) {
-                            node->memo.join_memo[pair_key] = JoinMemoEntry{
-                                l_hash, r_hash, ka_hash, kb_hash, matched, std::move(out_record)
-                            };
-                        }
-                    }
-                }
-                res.collection_val = std::move(new_col);
-                sp.status = StagePlanStatus::FULL;
-
-                uint64_t new_out_hash = res.as_value().hash();
-                if (new_out_hash != prev_out_hash) {
-                    node->version++;
-                    node->outHash = new_out_hash;
-                    for (const auto& down_id : graph_.order) {
-                        const auto* down_node = graph_.get_node(down_id);
-                        if (!down_node) continue;
-                        for (const auto& in_id : down_node->inputs) {
-                            if (in_id == node->id) {
-                                dirty_nodes.insert(down_id);
-                            }
-                        }
-                    }
-                }
-                break;
-            }
-
-            case NodeKind::SCALAR: {
-                res.is_collection = false;
-                sp.ops_total = 1;
-
-                uint64_t inputs_hash = 14695981039346656037ULL;
-                for (const auto& in_id : node->inputs) {
-                    inputs_hash ^= results[in_id].as_value().hash();
-                    inputs_hash *= 1099511628211ULL;
-                }
-
-                if (executor_.enable_memo() && node->memo.scalar_memo.valid &&
-                    node->memo.scalar_memo.inputsHash == inputs_hash &&
-                    node->memo.scalar_memo.fnHash == node->fnHash) {
-                    sp.ops_reused = 1;
-                    hist_entry.ops_reused += 1;
-                    sp.status = StagePlanStatus::REUSED;
-                    res.scalar_val = node->memo.scalar_memo.result;
-                } else {
-                    sp.ops_evaluated = 1;
-                    hist_entry.ops_recomputed += 1;
-                    sp.status = StagePlanStatus::FULL;
-
-                    BytecodeCompiler comp;
-                    auto prog = comp.compile(node->expr.get());
-                    res.scalar_val = VM::execute(prog, {}, stage_values);
-                    if (executor_.enable_memo()) {
-                        node->memo.scalar_memo = ScalarMemoEntry{inputs_hash, node->fnHash, res.scalar_val, true};
-                    }
-                }
-
-                uint64_t new_out_hash = res.as_value().hash();
-                if (new_out_hash != prev_out_hash) {
-                    node->version++;
-                    node->outHash = new_out_hash;
-                    for (const auto& down_id : graph_.order) {
-                        const auto* down_node = graph_.get_node(down_id);
-                        if (!down_node) continue;
-                        for (const auto& in_id : down_node->inputs) {
-                            if (in_id == node->id) {
-                                dirty_nodes.insert(down_id);
-                            }
-                        }
-                    }
-                }
-                break;
-            }
-
-            case NodeKind::OUTPUT: {
-                const auto& in_res = results[node->inputs[0]];
-                res = in_res;
-                uint64_t new_out_hash = res.as_value().hash();
-                if (new_out_hash != prev_out_hash) {
-                    node->version++;
-                    node->outHash = new_out_hash;
-                    plan.updated_outputs.push_back(node->name);
-                    hist_entry.outputs_changed.push_back(node->name);
-                }
-                break;
-            }
-        }
-
-        node->status = NodeStatus::CLEAN;
-        stage_values[node->name] = res.as_value();
-
-        if (node->kind != NodeKind::OUTPUT && node->kind != NodeKind::INPUT) {
-            plan.stages.push_back(std::move(sp));
-        }
+    // Patch the record and the collection hash in O(1) instead of rehashing
+    // the whole input.
+    NodeExecutionResult& input_res = it_res->second;
+    bool value_unchanged = (old_record_val == new_record_val);
+    input_res.term_sum -= collection_item_term(edit.record_id, old_record_val.hash());
+    input_res.term_sum += collection_item_term(edit.record_id, new_record_val.hash());
+    target_item->value = std::move(new_record_val);
+
+    // Invariant I4: version increases iff outHash changes
+    uint64_t new_input_hash = input_res.hash();
+    bool input_changed = (new_input_hash != input_node->outHash);
+    if (input_changed) {
+        input_node->version++;
+        input_node->outHash = new_input_hash;
+    }
+    stage_refs_ = analyze_stage_refs(graph_);
+    store_stage_value(stage_values, stage_refs_, input_node->name, input_res);
+
+    WorkSet ws;
+    ws.edit_kind = EditKind::MODIFY;
+    if (!value_unchanged && input_changed) {
+        // Seed work set: {(input_stage, RecordId)}
+        std::vector<RecordId> seed{edit.record_id};
+        mark_consumers(*input_node, build_consumer_index(graph_), ws, &seed);
     }
 
-    // Refresh executor outputs list
-    auto& exec_outputs = executor_.mutable_outputs();
-    exec_outputs.clear();
-    for (const auto& out_id : graph_.outputs) {
-        const auto* n = graph_.get_node(out_id);
-        if (n) {
-            exec_outputs.push_back({n->name, results[out_id].as_value().to_string()});
-        }
-    }
-
-    // Tally op counts for plan
-    for (const auto& sp : plan.stages) {
-        plan.recomputed_ops += sp.ops_evaluated;
-        plan.reused_ops += sp.ops_reused;
-        plan.full_rerun_ops += sp.ops_total;
-    }
-
-    if (plan.recomputed_ops + plan.reused_ops > 0) {
-        plan.reuse_percent = 100.0 * static_cast<double>(plan.reused_ops) /
-                             static_cast<double>(plan.recomputed_ops + plan.reused_ops);
-    } else {
-        plan.reuse_percent = 0.0;
-    }
-
-    hist_entry.ops_recomputed = plan.recomputed_ops;
-    hist_entry.ops_reused = plan.reused_ops;
-    hist_entry.total_memo_bytes = executor_.total_memo_bytes();
-    executor_.get_history().add_entry(std::move(hist_entry));
-
+    propagate(ws, plan, hist_entry);
     return plan;
 }
 
@@ -886,13 +333,7 @@ std::variant<RebuildPlan, CompileError> Propagator::apply_insert(const InsertEdi
         }
     }
 
-    // Backup graph and executor state for atomic rollback
-    Graph backup_graph = graph_.clone();
-    auto backup_results = executor_.get_all_results();
-    auto backup_stage_values = executor_.get_all_stage_values();
-    auto backup_outputs = executor_.get_outputs();
-
-    // 1. Create fresh NodeId
+    // 1. Create fresh NodeId (I2)
     static uint32_t insert_node_counter = 1000;
     NodeId new_nid = "n$" + std::to_string(insert_node_counter++);
     while (graph_.nodes.find(new_nid) != graph_.nodes.end()) {
@@ -911,21 +352,22 @@ std::variant<RebuildPlan, CompileError> Propagator::apply_insert(const InsertEdi
     new_node.type = new_output_type;
     new_node.status = NodeStatus::DIRTY;
 
-    // 2. Replace target_node.inputs[0] with new_nid
+    // 2. Replace target_node.inputs[0] with new_nid. Nothing else is touched
+    // before the topological sort, so undoing these two changes restores the
+    // prior state exactly (atomic edit) without copying results or memos.
+    NodeId target_id = target_node->id;
+    std::vector<NodeId> old_order = graph_.order;
     target_node->inputs[0] = new_nid;
     graph_.nodes[new_nid] = std::move(new_node);
 
     // 3. Recompute topological order (I1)
     if (!graph_.recompute_topological_order()) {
-        // Rollback
-        graph_ = std::move(backup_graph);
-        executor_.mutable_results() = std::move(backup_results);
-        executor_.mutable_stage_values() = std::move(backup_stage_values);
-        executor_.mutable_outputs() = std::move(backup_outputs);
+        graph_.get_node(target_id)->inputs[0] = p_id;
+        graph_.nodes.erase(new_nid);
+        graph_.order = std::move(old_order);
         return CompileError{ErrorCode::E601, edit.loc, "insert failed: cycle detected during topological sort"};
     }
 
-    // 4. Seed work set: evaluate new stage on all records of P
     EditId current_edit_id = executor_.get_history().next_edit_id++;
     RebuildPlan plan;
     plan.edit_id = current_edit_id;
@@ -935,465 +377,14 @@ std::variant<RebuildPlan, CompileError> Propagator::apply_insert(const InsertEdi
     hist_entry.edit_id = current_edit_id;
     hist_entry.description = edit.to_string();
 
-    auto& results = executor_.mutable_results();
-    auto& stage_values = executor_.mutable_stage_values();
+    // 4. Seed work set: the new stage is evaluated for every record of P
+    WorkSet ws;
+    ws.edit_kind = EditKind::INSERT;
+    ws.new_stage = new_nid;
+    ws.dirty.insert(new_nid);
+    ws.dirty.insert(target_id);
 
-    // Work set tracking
-    std::unordered_set<NodeId> dirty_nodes = {new_nid, target_node->id};
-    std::unordered_map<NodeId, std::unordered_set<RecordId>> pending_records;
-
-    // Propagate from new stage through all downstream stages in topological order
-    for (const auto& node_id : graph_.order) {
-        auto* node = graph_.get_node(node_id);
-        if (!node) continue;
-
-        bool is_new_stage = (node_id == new_nid);
-        bool is_dirty = (dirty_nodes.find(node_id) != dirty_nodes.end());
-        bool has_pending = (pending_records.find(node_id) != pending_records.end() &&
-                            !pending_records[node_id].empty());
-
-        if (!is_new_stage && !is_dirty && !has_pending) {
-            node->status = NodeStatus::CLEAN;
-            continue;
-        }
-
-        hist_entry.nodes_touched.push_back(node->name);
-        StagePlan sp;
-        sp.stage_name = node->name;
-
-        NodeExecutionResult& res = results[node_id];
-        uint64_t prev_out_hash = node->outHash;
-
-        if (node->kind == NodeKind::MAP) {
-            const auto& in_res = results[node->inputs[0]];
-            res.is_collection = true;
-            sp.ops_total = in_res.collection_val.size();
-
-            BytecodeCompiler compiler(node->fn->params);
-            auto prog = compiler.compile(node->fn->body.get());
-
-            Collection new_col;
-            new_col.reserve(in_res.collection_val.size());
-            std::unordered_set<RecordId> changed_records;
-
-            for (const auto& item : in_res.collection_val) {
-                uint64_t in_hash = item.value.hash();
-                bool can_reuse = false;
-                if (!is_new_stage && executor_.enable_memo()) {
-                    auto memo_it = node->memo.map_memo.find(item.id);
-                    if (memo_it != node->memo.map_memo.end() &&
-                        memo_it->second.inHash == in_hash &&
-                        memo_it->second.fnHash == node->fnHash) {
-                        can_reuse = true;
-                        sp.ops_reused++;
-                        hist_entry.ops_reused++;
-                        new_col.push_back(CollectionItem{item.id, memo_it->second.out});
-                    }
-                }
-
-                if (!can_reuse) {
-                    sp.ops_evaluated++;
-                    hist_entry.ops_recomputed++;
-                    Value out_val = VM::execute(prog, {item.value}, stage_values);
-                    if (executor_.enable_memo()) {
-                        node->memo.map_memo[item.id] = MapMemoEntry{in_hash, node->fnHash, out_val};
-                    }
-                    changed_records.insert(item.id);
-                    new_col.push_back(CollectionItem{item.id, std::move(out_val)});
-                }
-            }
-
-            res.collection_val = std::move(new_col);
-
-            if (is_new_stage) {
-                sp.status = StagePlanStatus::NEW;
-            } else if (sp.ops_evaluated == 0) {
-                sp.status = StagePlanStatus::REUSED;
-            } else if (sp.ops_evaluated == sp.ops_total) {
-                sp.status = StagePlanStatus::FULL;
-            } else {
-                sp.status = StagePlanStatus::PARTIAL;
-                sp.note = "(early cutoff on unchanged inputs)";
-            }
-
-            uint64_t new_out_hash = res.as_value().hash();
-            if (new_out_hash != prev_out_hash || is_new_stage) {
-                node->version++;
-                node->outHash = new_out_hash;
-                for (const auto& down_id : graph_.order) {
-                    const auto* down_node = graph_.get_node(down_id);
-                    if (!down_node) continue;
-                    for (const auto& in_id : down_node->inputs) {
-                        if (in_id == node->id) {
-                            dirty_nodes.insert(down_id);
-                            for (auto r : changed_records) pending_records[down_id].insert(r);
-                        }
-                    }
-                }
-            }
-        } else if (node->kind == NodeKind::FILTER) {
-            const auto& in_res = results[node->inputs[0]];
-            res.is_collection = true;
-            sp.ops_total = in_res.collection_val.size();
-
-            BytecodeCompiler compiler(node->fn->params);
-            auto prog = compiler.compile(node->fn->body.get());
-
-            Collection new_col;
-            std::unordered_set<RecordId> changed_records;
-
-            for (const auto& item : in_res.collection_val) {
-                uint64_t in_hash = item.value.hash();
-                bool keep = false;
-                bool can_reuse = false;
-
-                if (!is_new_stage && executor_.enable_memo()) {
-                    auto memo_it = node->memo.filter_memo.find(item.id);
-                    if (memo_it != node->memo.filter_memo.end() &&
-                        memo_it->second.inHash == in_hash &&
-                        memo_it->second.fnHash == node->fnHash) {
-                        can_reuse = true;
-                        sp.ops_reused++;
-                        hist_entry.ops_reused++;
-                        keep = memo_it->second.keep;
-                        if (keep) new_col.push_back(item);
-                    }
-                }
-
-                if (!can_reuse) {
-                    sp.ops_evaluated++;
-                    hist_entry.ops_recomputed++;
-                    Value keep_val = VM::execute(prog, {item.value}, stage_values);
-                    keep = keep_val.bool_val;
-                    if (executor_.enable_memo()) {
-                        node->memo.filter_memo[item.id] = FilterMemoEntry{in_hash, node->fnHash, keep};
-                    }
-                    changed_records.insert(item.id);
-                    if (keep) new_col.push_back(item);
-                }
-            }
-
-            res.collection_val = std::move(new_col);
-
-            if (is_new_stage) {
-                sp.status = StagePlanStatus::NEW;
-            } else if (sp.ops_evaluated == 0) {
-                sp.status = StagePlanStatus::REUSED;
-            } else if (sp.ops_evaluated == sp.ops_total) {
-                sp.status = StagePlanStatus::FULL;
-            } else {
-                sp.status = StagePlanStatus::PARTIAL;
-                sp.note = "(early cutoff on unchanged inputs)";
-            }
-
-            uint64_t new_out_hash = res.as_value().hash();
-            if (new_out_hash != prev_out_hash || is_new_stage) {
-                node->version++;
-                node->outHash = new_out_hash;
-                for (const auto& down_id : graph_.order) {
-                    const auto* down_node = graph_.get_node(down_id);
-                    if (!down_node) continue;
-                    for (const auto& in_id : down_node->inputs) {
-                        if (in_id == node->id) {
-                            dirty_nodes.insert(down_id);
-                            for (auto r : changed_records) pending_records[down_id].insert(r);
-                        }
-                    }
-                }
-            }
-        } else if (node->kind == NodeKind::REDUCE) {
-            const auto& in_res = results[node->inputs[0]];
-            res.is_collection = false;
-            sp.ops_total = in_res.collection_val.size();
-
-            uint64_t in_hash = in_res.as_value().hash();
-            uint64_t init_hash = node->init ? hash_expr_ir(node->init.get()) : 0;
-
-            if (executor_.enable_memo() && node->memo.reduce_memo.valid &&
-                node->memo.reduce_memo.inputHash == in_hash &&
-                node->memo.reduce_memo.fnHash == node->fnHash &&
-                node->memo.reduce_memo.initHash == init_hash) {
-                sp.ops_reused = sp.ops_total;
-                hist_entry.ops_reused += sp.ops_total;
-                sp.status = StagePlanStatus::REUSED;
-                res.scalar_val = node->memo.reduce_memo.result;
-            } else {
-                sp.ops_evaluated = sp.ops_total;
-                hist_entry.ops_recomputed += sp.ops_total;
-                sp.status = StagePlanStatus::FULL;
-                sp.note = "(reduce is O(n) in v1)";
-
-                BytecodeCompiler init_comp;
-                auto init_prog = init_comp.compile(node->init.get());
-                Value acc = VM::execute(init_prog, {}, stage_values);
-
-                if (node->fn.has_value()) {
-                    BytecodeCompiler fn_comp(node->fn->params);
-                    auto fn_prog = fn_comp.compile(node->fn->body.get());
-                    for (const auto& item : in_res.collection_val) {
-                        acc = VM::execute(fn_prog, {acc, item.value}, stage_values);
-                    }
-                }
-                res.scalar_val = acc;
-                if (executor_.enable_memo()) {
-                    node->memo.reduce_memo = ReduceMemoEntry{in_hash, node->fnHash, init_hash, acc, true};
-                }
-            }
-
-            uint64_t new_out_hash = res.as_value().hash();
-            if (new_out_hash != prev_out_hash) {
-                node->version++;
-                node->outHash = new_out_hash;
-                for (const auto& down_id : graph_.order) {
-                    const auto* down_node = graph_.get_node(down_id);
-                    if (!down_node) continue;
-                    for (const auto& in_id : down_node->inputs) {
-                        if (in_id == node->id) dirty_nodes.insert(down_id);
-                    }
-                }
-            }
-        } else if (node->kind == NodeKind::TREE_REDUCE) {
-            const auto& in_res = results[node->inputs[0]];
-            res.is_collection = false;
-            sp.ops_total = in_res.collection_val.size();
-
-            uint64_t in_hash = in_res.as_value().hash();
-            uint64_t init_hash = node->init ? hash_expr_ir(node->init.get()) : 0;
-
-            auto& memo = node->memo.tree_reduce_memo;
-            const auto& changed_recs = pending_records[node_id];
-
-            bool can_incremental = (executor_.enable_memo() && memo.valid &&
-                                    memo.fnHash == node->fnHash && memo.initHash == init_hash &&
-                                    memo.num_leaves == in_res.collection_val.size() &&
-                                    !changed_recs.empty());
-
-            if (can_incremental && in_res.collection_val.size() > 1) {
-                BytecodeCompiler fn_comp(node->fn->params);
-                auto fn_prog = fn_comp.compile(node->fn->body.get());
-
-                std::unordered_set<size_t> dirty_nodes_at_level;
-
-                for (auto rid : changed_recs) {
-                    auto leaf_it = memo.record_to_leaf.find(rid);
-                    if (leaf_it == memo.record_to_leaf.end()) continue;
-                    size_t leaf_idx = leaf_it->second;
-
-                    const Value* new_val_ptr = nullptr;
-                    for (const auto& it : in_res.collection_val) {
-                        if (it.id == rid) {
-                            new_val_ptr = &it.value;
-                            break;
-                        }
-                    }
-                    if (new_val_ptr) {
-                        memo.tree[leaf_idx] = *new_val_ptr;
-                        if (leaf_idx > 1) {
-                            dirty_nodes_at_level.insert(leaf_idx / 2);
-                        }
-                    }
-                }
-
-                while (!dirty_nodes_at_level.empty()) {
-                    std::unordered_set<size_t> next_level;
-                    for (size_t idx : dirty_nodes_at_level) {
-                        size_t left_child = 2 * idx;
-                        size_t right_child = 2 * idx + 1;
-                        if (memo.active[left_child] && memo.active[right_child]) {
-                            sp.ops_evaluated++;
-                            hist_entry.ops_recomputed++;
-                            memo.tree[idx] = VM::execute(fn_prog, {memo.tree[left_child], memo.tree[right_child]}, stage_values);
-                            memo.active[idx] = true;
-                        } else if (memo.active[left_child]) {
-                            memo.tree[idx] = memo.tree[left_child];
-                            memo.active[idx] = true;
-                        } else if (memo.active[right_child]) {
-                            memo.tree[idx] = memo.tree[right_child];
-                            memo.active[idx] = true;
-                        }
-                        if (idx > 1) {
-                            next_level.insert(idx / 2);
-                        }
-                    }
-                    dirty_nodes_at_level = std::move(next_level);
-                }
-
-                sp.ops_reused = sp.ops_total > sp.ops_evaluated ? (sp.ops_total - sp.ops_evaluated) : 0;
-                hist_entry.ops_reused += sp.ops_reused;
-                sp.status = StagePlanStatus::PARTIAL;
-                sp.note = "(tree_reduce O(log n) update)";
-                memo.result = memo.tree[1];
-                memo.inputHash = in_hash;
-                res.scalar_val = memo.tree[1];
-            } else {
-                BytecodeCompiler init_comp;
-                auto init_prog = init_comp.compile(node->init.get());
-                Value init_val = VM::execute(init_prog, {}, stage_values);
-
-                const auto& col = in_res.collection_val;
-                size_t n = col.size();
-
-                if (n == 0) {
-                    res.scalar_val = init_val;
-                    sp.status = StagePlanStatus::FULL;
-                } else if (n == 1) {
-                    sp.ops_evaluated = 1;
-                    hist_entry.ops_recomputed += 1;
-                    BytecodeCompiler fn_comp(node->fn->params);
-                    auto fn_prog = fn_comp.compile(node->fn->body.get());
-                    Value out = VM::execute(fn_prog, {init_val, col[0].value}, stage_values);
-                    res.scalar_val = out;
-                    sp.status = StagePlanStatus::FULL;
-                } else {
-                    sp.ops_evaluated = n - 1;
-                    hist_entry.ops_recomputed += n - 1;
-                    sp.status = StagePlanStatus::FULL;
-
-                    BytecodeCompiler fn_comp(node->fn->params);
-                    auto fn_prog = fn_comp.compile(node->fn->body.get());
-
-                    size_t m = 1;
-                    while (m < n) m <<= 1;
-
-                    memo.leaf_offset = m;
-                    memo.num_leaves = n;
-                    memo.tree.resize(2 * m);
-                    memo.active.resize(2 * m, false);
-                    memo.record_to_leaf.clear();
-
-                    for (size_t i = 0; i < n; ++i) {
-                        size_t leaf_idx = m + i;
-                        memo.tree[leaf_idx] = col[i].value;
-                        memo.active[leaf_idx] = true;
-                        memo.record_to_leaf[col[i].id] = leaf_idx;
-                    }
-
-                    for (size_t i = m - 1; i >= 1; --i) {
-                        size_t left_child = 2 * i;
-                        size_t right_child = 2 * i + 1;
-                        if (memo.active[left_child] && memo.active[right_child]) {
-                            memo.tree[i] = VM::execute(fn_prog, {memo.tree[left_child], memo.tree[right_child]}, stage_values);
-                            memo.active[i] = true;
-                        } else if (memo.active[left_child]) {
-                            memo.tree[i] = memo.tree[left_child];
-                            memo.active[i] = true;
-                        } else if (memo.active[right_child]) {
-                            memo.tree[i] = memo.tree[right_child];
-                            memo.active[i] = true;
-                        } else {
-                            memo.active[i] = false;
-                        }
-                    }
-
-                    res.scalar_val = memo.tree[1];
-                    memo.result = memo.tree[1];
-                    memo.inputHash = in_hash;
-                    memo.fnHash = node->fnHash;
-                    memo.initHash = init_hash;
-                    memo.valid = true;
-                }
-            }
-
-            uint64_t new_out_hash = res.as_value().hash();
-            if (new_out_hash != prev_out_hash) {
-                node->version++;
-                node->outHash = new_out_hash;
-                for (const auto& down_id : graph_.order) {
-                    const auto* down_node = graph_.get_node(down_id);
-                    if (!down_node) continue;
-                    for (const auto& in_id : down_node->inputs) {
-                        if (in_id == node->id) dirty_nodes.insert(down_id);
-                    }
-                }
-            }
-        } else if (node->kind == NodeKind::SCALAR) {
-            res.is_collection = false;
-            sp.ops_total = 1;
-
-            uint64_t inputs_hash = 14695981039346656037ULL;
-            for (const auto& in_id : node->inputs) {
-                inputs_hash ^= results[in_id].as_value().hash();
-                inputs_hash *= 1099511628211ULL;
-            }
-
-            if (executor_.enable_memo() && node->memo.scalar_memo.valid &&
-                node->memo.scalar_memo.inputsHash == inputs_hash &&
-                node->memo.scalar_memo.fnHash == node->fnHash) {
-                sp.ops_reused = 1;
-                hist_entry.ops_reused += 1;
-                sp.status = StagePlanStatus::REUSED;
-                res.scalar_val = node->memo.scalar_memo.result;
-            } else {
-                sp.ops_evaluated = 1;
-                hist_entry.ops_recomputed += 1;
-                sp.status = StagePlanStatus::FULL;
-
-                BytecodeCompiler comp;
-                auto prog = comp.compile(node->expr.get());
-                res.scalar_val = VM::execute(prog, {}, stage_values);
-                if (executor_.enable_memo()) {
-                    node->memo.scalar_memo = ScalarMemoEntry{inputs_hash, node->fnHash, res.scalar_val, true};
-                }
-            }
-
-            uint64_t new_out_hash = res.as_value().hash();
-            if (new_out_hash != prev_out_hash) {
-                node->version++;
-                node->outHash = new_out_hash;
-                for (const auto& down_id : graph_.order) {
-                    const auto* down_node = graph_.get_node(down_id);
-                    if (!down_node) continue;
-                    for (const auto& in_id : down_node->inputs) {
-                        if (in_id == node->id) dirty_nodes.insert(down_id);
-                    }
-                }
-            }
-        } else if (node->kind == NodeKind::OUTPUT) {
-            const auto& in_res = results[node->inputs[0]];
-            res = in_res;
-            uint64_t new_out_hash = res.as_value().hash();
-            if (new_out_hash != prev_out_hash) {
-                node->version++;
-                node->outHash = new_out_hash;
-                plan.updated_outputs.push_back(node->name);
-                hist_entry.outputs_changed.push_back(node->name);
-            }
-        }
-
-        node->status = NodeStatus::CLEAN;
-        stage_values[node->name] = res.as_value();
-        if (node->kind != NodeKind::OUTPUT && node->kind != NodeKind::INPUT) {
-            plan.stages.push_back(std::move(sp));
-        }
-    }
-
-    // Refresh outputs
-    auto& exec_outputs = executor_.mutable_outputs();
-    exec_outputs.clear();
-    for (const auto& out_id : graph_.outputs) {
-        const auto* n = graph_.get_node(out_id);
-        if (n) {
-            exec_outputs.push_back({n->name, results[out_id].as_value().to_string()});
-        }
-    }
-
-    for (const auto& sp : plan.stages) {
-        plan.recomputed_ops += sp.ops_evaluated;
-        plan.reused_ops += sp.ops_reused;
-        plan.full_rerun_ops += sp.ops_total;
-    }
-    if (plan.recomputed_ops + plan.reused_ops > 0) {
-        plan.reuse_percent = 100.0 * static_cast<double>(plan.reused_ops) /
-                             static_cast<double>(plan.recomputed_ops + plan.reused_ops);
-    } else {
-        plan.reuse_percent = 0.0;
-    }
-
-    hist_entry.ops_recomputed = plan.recomputed_ops;
-    hist_entry.ops_reused = plan.reused_ops;
-    hist_entry.total_memo_bytes = executor_.total_memo_bytes();
-    executor_.get_history().add_entry(std::move(hist_entry));
-
+    propagate(ws, plan, hist_entry);
     return plan;
 }
 
@@ -1441,21 +432,21 @@ std::variant<RebuildPlan, CompileError> Propagator::apply_delete(const DeleteEdi
                             "delete failed: output type of '" + edit.stage_name + "' differs from input type and breaks consumers"};
     }
 
-    // Backup graph & executor state for atomic rollback
-    Graph backup_graph = graph_.clone();
-    auto backup_results = executor_.get_all_results();
-    auto backup_stage_values = executor_.get_all_stage_values();
-    auto backup_outputs = executor_.get_outputs();
-
+    // Record exactly what we rewire so a failed topological sort can be undone
+    // without snapshotting every result and memo table (atomic edit).
     NodeId target_id = target_node->id;
+    std::string target_name = target_node->name;
+    std::vector<NodeId> old_order = graph_.order;
+    std::vector<std::pair<NodeId, size_t>> rewired; // (consumer, input slot)
     std::vector<NodeId> consumers;
 
     // 1. For every consumer C of target_node, replace reference with p_id
     for (auto& [id, n] : graph_.nodes) {
         bool is_consumer = false;
-        for (auto& in_id : n.inputs) {
-            if (in_id == target_id) {
-                in_id = p_id;
+        for (size_t i = 0; i < n.inputs.size(); ++i) {
+            if (n.inputs[i] == target_id) {
+                n.inputs[i] = p_id;
+                rewired.push_back({id, i});
                 is_consumer = true;
             }
         }
@@ -1464,15 +455,17 @@ std::variant<RebuildPlan, CompileError> Propagator::apply_delete(const DeleteEdi
         }
     }
 
-    // 2. Remove target_node from graph
+    // 2. Remove target_node from graph (NodeId is never reused, I2)
+    Node removed = std::move(graph_.nodes[target_id]);
     graph_.nodes.erase(target_id);
 
     // 3. Recompute topological order
     if (!graph_.recompute_topological_order()) {
-        graph_ = std::move(backup_graph);
-        executor_.mutable_results() = std::move(backup_results);
-        executor_.mutable_stage_values() = std::move(backup_stage_values);
-        executor_.mutable_outputs() = std::move(backup_outputs);
+        graph_.nodes[target_id] = std::move(removed);
+        for (const auto& [cid, slot] : rewired) {
+            graph_.get_node(cid)->inputs[slot] = target_id;
+        }
+        graph_.order = std::move(old_order);
         return CompileError{ErrorCode::E601, edit.loc, "delete failed: cycle detected during topological sort"};
     }
 
@@ -1486,452 +479,616 @@ std::variant<RebuildPlan, CompileError> Propagator::apply_delete(const DeleteEdi
     hist_entry.description = edit.to_string();
 
     auto& results = executor_.mutable_results();
-    auto& stage_values = executor_.mutable_stage_values();
     results.erase(target_id);
-    stage_values.erase(edit.stage_name);
+    executor_.mutable_stage_values().erase(target_name);
 
-    std::unordered_set<NodeId> dirty_nodes(consumers.begin(), consumers.end());
-    std::unordered_map<NodeId, std::unordered_set<RecordId>> pending_records;
-
-    // Seed consumers with records from p_node
+    // 4. Seed consumers with every record of P: each consumer reuses memo
+    // entries whose input hash is unchanged (early cutoff).
+    WorkSet ws;
+    ws.edit_kind = EditKind::DELETE;
+    std::vector<RecordId> seed;
     const auto& p_res = results[p_id];
     if (p_res.is_collection) {
-        for (const auto& c_id : consumers) {
-            for (const auto& item : p_res.collection_val) {
-                pending_records[c_id].insert(item.id);
-            }
+        seed.reserve(p_res.collection_val.size());
+        for (const auto& item : p_res.collection_val) {
+            seed.push_back(item.id);
         }
     }
+    for (const auto& c_id : consumers) {
+        seed_consumer(c_id, ws, p_res.is_collection ? &seed : nullptr);
+    }
 
-    // 4. Propagate topologically
+    propagate(ws, plan, hist_entry);
+    return plan;
+}
+
+void Propagator::seed_consumer(const NodeId& consumer, WorkSet& ws,
+                               const std::vector<RecordId>* records) {
+    ws.dirty.insert(consumer);
+    const Node* cn = graph_.get_node(consumer);
+    if (records && !stage_invalidation_ && cn && tracks_records(cn->kind)) {
+        ws.pending[consumer].insert(records->begin(), records->end());
+    } else {
+        ws.full_scan.insert(consumer);
+    }
+}
+
+void Propagator::mark_consumers(const Node& node, const ConsumerIndex& consumers, WorkSet& ws,
+                                const std::vector<RecordId>* changed_out) {
+    auto it = consumers.find(node.id);
+    if (it == consumers.end()) return;
+    for (const auto& c : it->second) {
+        seed_consumer(c, ws, changed_out);
+    }
+}
+
+void Propagator::refresh_stage_values() {
+    auto& stage_values = executor_.mutable_stage_values();
+    const auto& results = executor_.get_all_results();
+    for (const auto& [name, use] : stage_refs_) {
+        if (use == StageRefUse::NONE) continue;
+        auto sv = stage_values.find(name);
+        bool missing = (sv == stage_values.end());
+        bool size_only = !missing && use == StageRefUse::FULL &&
+                         sv->second.kind == ValueKind::ARRAY && sv->second.int_val != 0;
+        if (!missing && !size_only) continue;
+        for (const auto& [id, n] : graph_.nodes) {
+            if (n.name != name || n.kind == NodeKind::OUTPUT) continue;
+            auto r = results.find(id);
+            if (r != results.end()) {
+                store_stage_value(stage_values, stage_refs_, name, r->second);
+            }
+            break;
+        }
+    }
+}
+
+void Propagator::propagate(WorkSet& ws, RebuildPlan& plan, HistoryEntry& hist) {
+    stage_refs_ = analyze_stage_refs(graph_);
+    refresh_stage_values();
+    ConsumerIndex consumers = build_consumer_index(graph_);
+    auto& results = executor_.mutable_results();
+    auto& stage_values = executor_.mutable_stage_values();
+
+    // Propagation algorithm (EDIT_SEMANTICS.md section 6), topological order (I1)
     for (const auto& node_id : graph_.order) {
-        auto* node = graph_.get_node(node_id);
+        Node* node = graph_.get_node(node_id);
         if (!node) continue;
-
-        bool is_dirty = (dirty_nodes.find(node_id) != dirty_nodes.end());
-        bool has_pending = (pending_records.find(node_id) != pending_records.end() &&
-                            !pending_records[node_id].empty());
-
-        if (!is_dirty && !has_pending) {
+        if (node->kind == NodeKind::INPUT || ws.dirty.find(node_id) == ws.dirty.end()) {
+            // No pending work and no dirty inputs: early cutoff / clean
             node->status = NodeStatus::CLEAN;
             continue;
         }
 
-        hist_entry.nodes_touched.push_back(node->name);
-        StagePlan sp;
-        sp.stage_name = node->name;
-
-        NodeExecutionResult& res = results[node_id];
+        hist.nodes_touched.push_back(node->name);
         uint64_t prev_out_hash = node->outHash;
 
-        if (node->kind == NodeKind::MAP) {
-            const auto& in_res = results[node->inputs[0]];
-            res.is_collection = true;
-            sp.ops_total = in_res.collection_val.size();
-
-            BytecodeCompiler compiler(node->fn->params);
-            auto prog = compiler.compile(node->fn->body.get());
-
-            Collection new_col;
-            new_col.reserve(in_res.collection_val.size());
-            std::unordered_set<RecordId> changed_records;
-
-            for (const auto& item : in_res.collection_val) {
-                uint64_t in_hash = item.value.hash();
-                bool can_reuse = false;
-                if (executor_.enable_memo()) {
-                    auto memo_it = node->memo.map_memo.find(item.id);
-                    if (memo_it != node->memo.map_memo.end() &&
-                        memo_it->second.inHash == in_hash &&
-                        memo_it->second.fnHash == node->fnHash) {
-                        can_reuse = true;
-                        sp.ops_reused++;
-                        hist_entry.ops_reused++;
-                        new_col.push_back(CollectionItem{item.id, memo_it->second.out});
-                    }
-                }
-
-                if (!can_reuse) {
-                    sp.ops_evaluated++;
-                    hist_entry.ops_recomputed++;
-                    Value out_val = VM::execute(prog, {item.value}, stage_values);
-                    if (executor_.enable_memo()) {
-                        node->memo.map_memo[item.id] = MapMemoEntry{in_hash, node->fnHash, out_val};
-                    }
-                    changed_records.insert(item.id);
-                    new_col.push_back(CollectionItem{item.id, std::move(out_val)});
-                }
-            }
-
-            res.collection_val = std::move(new_col);
-
-            if (sp.ops_evaluated == 0) {
-                sp.status = StagePlanStatus::REUSED;
-            } else if (sp.ops_evaluated == sp.ops_total) {
-                sp.status = StagePlanStatus::FULL;
-            } else {
-                sp.status = StagePlanStatus::PARTIAL;
-                sp.note = "(early cutoff on unchanged inputs)";
-            }
-
-            uint64_t new_out_hash = res.as_value().hash();
-            if (new_out_hash != prev_out_hash) {
-                node->version++;
-                node->outHash = new_out_hash;
-                for (const auto& down_id : graph_.order) {
-                    const auto* down_node = graph_.get_node(down_id);
-                    if (!down_node) continue;
-                    for (const auto& in_id : down_node->inputs) {
-                        if (in_id == node->id) {
-                            dirty_nodes.insert(down_id);
-                            for (auto r : changed_records) pending_records[down_id].insert(r);
-                        }
-                    }
-                }
-            }
-        } else if (node->kind == NodeKind::FILTER) {
-            const auto& in_res = results[node->inputs[0]];
-            res.is_collection = true;
-            sp.ops_total = in_res.collection_val.size();
-
-            BytecodeCompiler compiler(node->fn->params);
-            auto prog = compiler.compile(node->fn->body.get());
-
-            Collection new_col;
-            std::unordered_set<RecordId> changed_records;
-
-            for (const auto& item : in_res.collection_val) {
-                uint64_t in_hash = item.value.hash();
-                bool keep = false;
-                bool can_reuse = false;
-
-                if (executor_.enable_memo()) {
-                    auto memo_it = node->memo.filter_memo.find(item.id);
-                    if (memo_it != node->memo.filter_memo.end() &&
-                        memo_it->second.inHash == in_hash &&
-                        memo_it->second.fnHash == node->fnHash) {
-                        can_reuse = true;
-                        sp.ops_reused++;
-                        hist_entry.ops_reused++;
-                        keep = memo_it->second.keep;
-                        if (keep) new_col.push_back(item);
-                    }
-                }
-
-                if (!can_reuse) {
-                    sp.ops_evaluated++;
-                    hist_entry.ops_recomputed++;
-                    Value keep_val = VM::execute(prog, {item.value}, stage_values);
-                    keep = keep_val.bool_val;
-                    if (executor_.enable_memo()) {
-                        node->memo.filter_memo[item.id] = FilterMemoEntry{in_hash, node->fnHash, keep};
-                    }
-                    changed_records.insert(item.id);
-                    if (keep) new_col.push_back(item);
-                }
-            }
-
-            res.collection_val = std::move(new_col);
-
-            if (sp.ops_evaluated == 0) {
-                sp.status = StagePlanStatus::REUSED;
-            } else if (sp.ops_evaluated == sp.ops_total) {
-                sp.status = StagePlanStatus::FULL;
-            } else {
-                sp.status = StagePlanStatus::PARTIAL;
-                sp.note = "(early cutoff on unchanged inputs)";
-            }
-
-            uint64_t new_out_hash = res.as_value().hash();
-            if (new_out_hash != prev_out_hash) {
-                node->version++;
-                node->outHash = new_out_hash;
-                for (const auto& down_id : graph_.order) {
-                    const auto* down_node = graph_.get_node(down_id);
-                    if (!down_node) continue;
-                    for (const auto& in_id : down_node->inputs) {
-                        if (in_id == node->id) {
-                            dirty_nodes.insert(down_id);
-                            for (auto r : changed_records) pending_records[down_id].insert(r);
-                        }
-                    }
-                }
-            }
-        } else if (node->kind == NodeKind::REDUCE) {
-            const auto& in_res = results[node->inputs[0]];
-            res.is_collection = false;
-            sp.ops_total = in_res.collection_val.size();
-
-            uint64_t in_hash = in_res.as_value().hash();
-            uint64_t init_hash = node->init ? hash_expr_ir(node->init.get()) : 0;
-
-            if (executor_.enable_memo() && node->memo.reduce_memo.valid &&
-                node->memo.reduce_memo.inputHash == in_hash &&
-                node->memo.reduce_memo.fnHash == node->fnHash &&
-                node->memo.reduce_memo.initHash == init_hash) {
-                sp.ops_reused = sp.ops_total;
-                hist_entry.ops_reused += sp.ops_total;
-                sp.status = StagePlanStatus::REUSED;
-                res.scalar_val = node->memo.reduce_memo.result;
-            } else {
-                sp.ops_evaluated = sp.ops_total;
-                hist_entry.ops_recomputed += sp.ops_total;
-                sp.status = StagePlanStatus::FULL;
-                sp.note = "(reduce is O(n) in v1)";
-
-                BytecodeCompiler init_comp;
-                auto init_prog = init_comp.compile(node->init.get());
-                Value acc = VM::execute(init_prog, {}, stage_values);
-
-                if (node->fn.has_value()) {
-                    BytecodeCompiler fn_comp(node->fn->params);
-                    auto fn_prog = fn_comp.compile(node->fn->body.get());
-                    for (const auto& item : in_res.collection_val) {
-                        acc = VM::execute(fn_prog, {acc, item.value}, stage_values);
-                    }
-                }
-                res.scalar_val = acc;
-                if (executor_.enable_memo()) {
-                    node->memo.reduce_memo = ReduceMemoEntry{in_hash, node->fnHash, init_hash, acc, true};
-                }
-            }
-
-            uint64_t new_out_hash = res.as_value().hash();
-            if (new_out_hash != prev_out_hash) {
-                node->version++;
-                node->outHash = new_out_hash;
-                for (const auto& down_id : graph_.order) {
-                    const auto* down_node = graph_.get_node(down_id);
-                    if (!down_node) continue;
-                    for (const auto& in_id : down_node->inputs) {
-                        if (in_id == node->id) dirty_nodes.insert(down_id);
-                    }
-                }
-            }
-        } else if (node->kind == NodeKind::TREE_REDUCE) {
-            const auto& in_res = results[node->inputs[0]];
-            res.is_collection = false;
-            sp.ops_total = in_res.collection_val.size();
-
-            uint64_t in_hash = in_res.as_value().hash();
-            uint64_t init_hash = node->init ? hash_expr_ir(node->init.get()) : 0;
-
-            auto& memo = node->memo.tree_reduce_memo;
-            const auto& changed_recs = pending_records[node_id];
-
-            bool can_incremental = (executor_.enable_memo() && memo.valid &&
-                                    memo.fnHash == node->fnHash && memo.initHash == init_hash &&
-                                    memo.num_leaves == in_res.collection_val.size() &&
-                                    !changed_recs.empty());
-
-            if (can_incremental && in_res.collection_val.size() > 1) {
-                BytecodeCompiler fn_comp(node->fn->params);
-                auto fn_prog = fn_comp.compile(node->fn->body.get());
-
-                std::unordered_set<size_t> dirty_nodes_at_level;
-
-                for (auto rid : changed_recs) {
-                    auto leaf_it = memo.record_to_leaf.find(rid);
-                    if (leaf_it == memo.record_to_leaf.end()) continue;
-                    size_t leaf_idx = leaf_it->second;
-
-                    const Value* new_val_ptr = nullptr;
-                    for (const auto& it : in_res.collection_val) {
-                        if (it.id == rid) {
-                            new_val_ptr = &it.value;
-                            break;
-                        }
-                    }
-                    if (new_val_ptr) {
-                        memo.tree[leaf_idx] = *new_val_ptr;
-                        if (leaf_idx > 1) {
-                            dirty_nodes_at_level.insert(leaf_idx / 2);
-                        }
-                    }
-                }
-
-                while (!dirty_nodes_at_level.empty()) {
-                    std::unordered_set<size_t> next_level;
-                    for (size_t idx : dirty_nodes_at_level) {
-                        size_t left_child = 2 * idx;
-                        size_t right_child = 2 * idx + 1;
-                        if (memo.active[left_child] && memo.active[right_child]) {
-                            sp.ops_evaluated++;
-                            hist_entry.ops_recomputed++;
-                            memo.tree[idx] = VM::execute(fn_prog, {memo.tree[left_child], memo.tree[right_child]}, stage_values);
-                            memo.active[idx] = true;
-                        } else if (memo.active[left_child]) {
-                            memo.tree[idx] = memo.tree[left_child];
-                            memo.active[idx] = true;
-                        } else if (memo.active[right_child]) {
-                            memo.tree[idx] = memo.tree[right_child];
-                            memo.active[idx] = true;
-                        }
-                        if (idx > 1) {
-                            next_level.insert(idx / 2);
-                        }
-                    }
-                    dirty_nodes_at_level = std::move(next_level);
-                }
-
-                sp.ops_reused = sp.ops_total > sp.ops_evaluated ? (sp.ops_total - sp.ops_evaluated) : 0;
-                hist_entry.ops_reused += sp.ops_reused;
-                sp.status = StagePlanStatus::PARTIAL;
-                sp.note = "(tree_reduce O(log n) update)";
-                memo.result = memo.tree[1];
-                memo.inputHash = in_hash;
-                res.scalar_val = memo.tree[1];
-            } else {
-                BytecodeCompiler init_comp;
-                auto init_prog = init_comp.compile(node->init.get());
-                Value init_val = VM::execute(init_prog, {}, stage_values);
-
-                const auto& col = in_res.collection_val;
-                size_t n = col.size();
-
-                if (n == 0) {
-                    res.scalar_val = init_val;
-                    sp.status = StagePlanStatus::FULL;
-                } else if (n == 1) {
-                    sp.ops_evaluated = 1;
-                    hist_entry.ops_recomputed += 1;
-                    BytecodeCompiler fn_comp(node->fn->params);
-                    auto fn_prog = fn_comp.compile(node->fn->body.get());
-                    Value out = VM::execute(fn_prog, {init_val, col[0].value}, stage_values);
-                    res.scalar_val = out;
-                    sp.status = StagePlanStatus::FULL;
-                } else {
-                    sp.ops_evaluated = n - 1;
-                    hist_entry.ops_recomputed += n - 1;
-                    sp.status = StagePlanStatus::FULL;
-
-                    BytecodeCompiler fn_comp(node->fn->params);
-                    auto fn_prog = fn_comp.compile(node->fn->body.get());
-
-                    size_t m = 1;
-                    while (m < n) m <<= 1;
-
-                    memo.leaf_offset = m;
-                    memo.num_leaves = n;
-                    memo.tree.resize(2 * m);
-                    memo.active.resize(2 * m, false);
-                    memo.record_to_leaf.clear();
-
-                    for (size_t i = 0; i < n; ++i) {
-                        size_t leaf_idx = m + i;
-                        memo.tree[leaf_idx] = col[i].value;
-                        memo.active[leaf_idx] = true;
-                        memo.record_to_leaf[col[i].id] = leaf_idx;
-                    }
-
-                    for (size_t i = m - 1; i >= 1; --i) {
-                        size_t left_child = 2 * i;
-                        size_t right_child = 2 * i + 1;
-                        if (memo.active[left_child] && memo.active[right_child]) {
-                            memo.tree[i] = VM::execute(fn_prog, {memo.tree[left_child], memo.tree[right_child]}, stage_values);
-                            memo.active[i] = true;
-                        } else if (memo.active[left_child]) {
-                            memo.tree[i] = memo.tree[left_child];
-                            memo.active[i] = true;
-                        } else if (memo.active[right_child]) {
-                            memo.tree[i] = memo.tree[right_child];
-                            memo.active[i] = true;
-                        } else {
-                            memo.active[i] = false;
-                        }
-                    }
-
-                    res.scalar_val = memo.tree[1];
-                    memo.result = memo.tree[1];
-                    memo.inputHash = in_hash;
-                    memo.fnHash = node->fnHash;
-                    memo.initHash = init_hash;
-                    memo.valid = true;
-                }
-            }
-
-            uint64_t new_out_hash = res.as_value().hash();
-            if (new_out_hash != prev_out_hash) {
-                node->version++;
-                node->outHash = new_out_hash;
-                for (const auto& down_id : graph_.order) {
-                    const auto* down_node = graph_.get_node(down_id);
-                    if (!down_node) continue;
-                    for (const auto& in_id : down_node->inputs) {
-                        if (in_id == node->id) dirty_nodes.insert(down_id);
-                    }
-                }
-            }
-        } else if (node->kind == NodeKind::SCALAR) {
-            res.is_collection = false;
-            sp.ops_total = 1;
-
-            uint64_t inputs_hash = 14695981039346656037ULL;
-            for (const auto& in_id : node->inputs) {
-                inputs_hash ^= results[in_id].as_value().hash();
-                inputs_hash *= 1099511628211ULL;
-            }
-
-            if (executor_.enable_memo() && node->memo.scalar_memo.valid &&
-                node->memo.scalar_memo.inputsHash == inputs_hash &&
-                node->memo.scalar_memo.fnHash == node->fnHash) {
-                sp.ops_reused = 1;
-                hist_entry.ops_reused += 1;
-                sp.status = StagePlanStatus::REUSED;
-                res.scalar_val = node->memo.scalar_memo.result;
-            } else {
-                sp.ops_evaluated = 1;
-                hist_entry.ops_recomputed += 1;
-                sp.status = StagePlanStatus::FULL;
-
-                BytecodeCompiler comp;
-                auto prog = comp.compile(node->expr.get());
-                res.scalar_val = VM::execute(prog, {}, stage_values);
-                if (executor_.enable_memo()) {
-                    node->memo.scalar_memo = ScalarMemoEntry{inputs_hash, node->fnHash, res.scalar_val, true};
-                }
-            }
-
-            uint64_t new_out_hash = res.as_value().hash();
-            if (new_out_hash != prev_out_hash) {
-                node->version++;
-                node->outHash = new_out_hash;
-                for (const auto& down_id : graph_.order) {
-                    const auto* down_node = graph_.get_node(down_id);
-                    if (!down_node) continue;
-                    for (const auto& in_id : down_node->inputs) {
-                        if (in_id == node->id) dirty_nodes.insert(down_id);
-                    }
-                }
-            }
-        } else if (node->kind == NodeKind::OUTPUT) {
-            const auto& in_res = results[node->inputs[0]];
-            res = in_res;
-            uint64_t new_out_hash = res.as_value().hash();
+        if (node->kind == NodeKind::OUTPUT) {
+            NodeExecutionResult& res = results[node_id];
+            res = results[node->inputs[0]];
+            uint64_t new_out_hash = res.hash();
             if (new_out_hash != prev_out_hash) {
                 node->version++;
                 node->outHash = new_out_hash;
                 plan.updated_outputs.push_back(node->name);
-                hist_entry.outputs_changed.push_back(node->name);
+                hist.outputs_changed.push_back(node->name);
             }
+            node->status = NodeStatus::CLEAN;
+            continue;
         }
 
-        node->status = NodeStatus::CLEAN;
-        stage_values[node->name] = res.as_value();
-        if (node->kind != NodeKind::OUTPUT && node->kind != NodeKind::INPUT) {
-            plan.stages.push_back(std::move(sp));
+        StagePlan sp;
+        sp.stage_name = node->name;
+        std::vector<RecordId> changed_out;
+        bool tracked = false;
+
+        switch (node->kind) {
+            case NodeKind::MAP:
+            case NodeKind::FILTER:
+                process_map_filter(*node, ws, sp, changed_out);
+                tracked = !stage_invalidation_;
+                break;
+            case NodeKind::REDUCE:
+                process_reduce(*node, sp);
+                break;
+            case NodeKind::TREE_REDUCE:
+                process_tree_reduce(*node, ws, sp);
+                break;
+            case NodeKind::JOIN:
+                process_join(*node, sp);
+                break;
+            case NodeKind::SCALAR:
+                process_scalar(*node, sp);
+                break;
+            case NodeKind::INPUT:
+            case NodeKind::OUTPUT:
+                break;
         }
+
+        const NodeExecutionResult& res = results[node_id];
+        uint64_t new_out_hash = res.hash();
+        bool is_new = (node_id == ws.new_stage);
+        // Invariant I4; an unchanged output hash is the early cutoff
+        if (new_out_hash != prev_out_hash || is_new) {
+            node->version++;
+            node->outHash = new_out_hash;
+            mark_consumers(*node, consumers, ws, tracked ? &changed_out : nullptr);
+        }
+        node->status = NodeStatus::CLEAN;
+        store_stage_value(stage_values, stage_refs_, node->name, res);
+        plan.stages.push_back(std::move(sp));
     }
 
+    // Refresh executor outputs; only changed outputs are printed again
     auto& exec_outputs = executor_.mutable_outputs();
+    std::unordered_map<std::string, std::string> old_strings;
+    for (auto& [name, str] : exec_outputs) {
+        old_strings[name] = std::move(str);
+    }
+    std::unordered_set<std::string> changed(plan.updated_outputs.begin(), plan.updated_outputs.end());
     exec_outputs.clear();
     for (const auto& out_id : graph_.outputs) {
         const auto* n = graph_.get_node(out_id);
-        if (n) {
+        if (!n) continue;
+        auto old = old_strings.find(n->name);
+        if (old != old_strings.end() && changed.find(n->name) == changed.end()) {
+            exec_outputs.push_back({n->name, std::move(old->second)});
+        } else {
             exec_outputs.push_back({n->name, results[out_id].as_value().to_string()});
         }
     }
 
+    finish_plan(plan, hist);
+}
+
+void Propagator::process_map_filter(Node& node, WorkSet& ws, StagePlan& sp,
+                                    std::vector<RecordId>& changed_out) {
+    auto& results = executor_.mutable_results();
+    auto& stage_values = executor_.mutable_stage_values();
+    NodeExecutionResult& res = results[node.id];
+    const Collection& in = results[node.inputs[0]].collection_val;
+
+    const bool is_map = (node.kind == NodeKind::MAP);
+    const bool is_new = (node.id == ws.new_stage);
+    const bool lookup_memo = use_record_memo() && !is_new;
+    const bool store_memo = use_record_memo();
+
+    res.is_collection = true;
+    sp.ops_total = in.size();
+
+    BytecodeCompiler compiler(node.fn->params);
+    auto prog = compiler.compile(node.fn->body.get());
+
+    // Evaluates one record. Returns true if fn ran (memo miss); sets present
+    // (record is in the output) and out (its output value).
+    auto eval = [&](const CollectionItem& item, bool& present, Value& out) -> bool {
+        uint64_t in_hash = item.value.hash();
+        if (lookup_memo) {
+            // Invariant I3: reuse only if inHash AND fnHash match
+            if (is_map) {
+                auto it = node.memo.map_memo.find(item.id);
+                if (it != node.memo.map_memo.end() && it->second.inHash == in_hash &&
+                    it->second.fnHash == node.fnHash) {
+                    present = true;
+                    out = it->second.out;
+                    return false;
+                }
+            } else {
+                auto it = node.memo.filter_memo.find(item.id);
+                if (it != node.memo.filter_memo.end() && it->second.inHash == in_hash &&
+                    it->second.fnHash == node.fnHash) {
+                    present = it->second.keep;
+                    if (present) out = item.value;
+                    return false;
+                }
+            }
+        }
+        sp.ops_evaluated++;
+        Value v = VM::execute(prog, {item.value}, stage_values);
+        if (is_map) {
+            if (store_memo) node.memo.map_memo[item.id] = MapMemoEntry{in_hash, node.fnHash, v};
+            present = true;
+            out = std::move(v);
+        } else {
+            present = v.bool_val;
+            if (store_memo) node.memo.filter_memo[item.id] = FilterMemoEntry{in_hash, node.fnHash, present};
+            if (present) out = item.value;
+        }
+        return true;
+    };
+
+    auto pend_it = ws.pending.find(node.id);
+    size_t n_pending = (pend_it == ws.pending.end()) ? 0 : pend_it->second.size();
+    // Patch in place when few records changed; when many changed, one sequential
+    // pass is cheaper than many binary searches and vector inserts.
+    bool full = is_new || !lookup_memo || ws.full_scan.count(node.id) > 0 ||
+                n_pending * 8 > in.size();
+
+    if (full) {
+        Collection old = std::move(res.collection_val);
+        Collection out_col;
+        out_col.reserve(is_map ? in.size() : old.size());
+        uint64_t sum = 0;
+        // B1 consumers rescan everything, so they need no changed-record set
+        const bool track = !stage_invalidation_;
+        size_t oi = 0;
+        for (const auto& item : in) {
+            bool present = false;
+            Value v;
+            bool reevaluated = eval(item, present, v);
+            if (track) {
+                while (oi < old.size() && old[oi].id < item.id) {
+                    changed_out.push_back(old[oi++].id); // dropped upstream
+                }
+                bool had = (oi < old.size() && old[oi].id == item.id);
+                if (had) {
+                    // A memo hit reproduces the previous output for this record,
+                    // so only re-evaluated records can differ.
+                    if (!present || (reevaluated && old[oi].value != v)) {
+                        changed_out.push_back(item.id);
+                    }
+                    oi++;
+                } else if (present) {
+                    changed_out.push_back(item.id);
+                }
+            }
+            if (present) {
+                sum += collection_item_term(item.id, v.hash());
+                out_col.push_back(CollectionItem{item.id, std::move(v)});
+            }
+        }
+        if (track) {
+            while (oi < old.size()) {
+                changed_out.push_back(old[oi++].id);
+            }
+        }
+        res.collection_val = std::move(out_col);
+        res.term_sum = sum;
+    } else if (n_pending > 0) {
+        std::vector<RecordId> ids(pend_it->second.begin(), pend_it->second.end());
+        std::sort(ids.begin(), ids.end());
+        Collection& col = res.collection_val;
+        for (RecordId rid : ids) {
+            const CollectionItem* in_item = find_record(in, rid);
+            auto pos = lower_bound_id(col, rid);
+            bool had = (pos != col.end() && pos->id == rid);
+            bool present = false;
+            bool reevaluated = false;
+            Value v;
+            if (in_item) {
+                reevaluated = eval(*in_item, present, v);
+            }
+            if (had && present) {
+                if (reevaluated && pos->value != v) {
+                    res.term_sum -= collection_item_term(rid, pos->value.hash());
+                    res.term_sum += collection_item_term(rid, v.hash());
+                    pos->value = std::move(v);
+                    changed_out.push_back(rid);
+                }
+            } else if (had) {
+                res.term_sum -= collection_item_term(rid, pos->value.hash());
+                col.erase(pos);
+                changed_out.push_back(rid);
+            } else if (present) {
+                res.term_sum += collection_item_term(rid, v.hash());
+                col.insert(pos, CollectionItem{rid, std::move(v)});
+                changed_out.push_back(rid);
+            }
+        }
+    }
+
+    if (is_new) {
+        // Consumers used to read P directly, so every record of P may differ
+        // from what they saw before.
+        changed_out.clear();
+        for (const auto& item : in) {
+            changed_out.push_back(item.id);
+        }
+    }
+
+    // Records not evaluated were served from the memo (or were untouched).
+    sp.ops_reused = sp.ops_total - sp.ops_evaluated;
+    if (is_new) {
+        sp.status = StagePlanStatus::NEW;
+    } else if (sp.ops_evaluated == 0) {
+        sp.status = StagePlanStatus::REUSED;
+    } else if (sp.ops_evaluated == sp.ops_total) {
+        sp.status = StagePlanStatus::FULL;
+    } else {
+        sp.status = StagePlanStatus::PARTIAL;
+        if (is_map || ws.edit_kind != EditKind::MODIFY) {
+            sp.note = "(early cutoff on unchanged inputs)";
+        }
+    }
+}
+
+void Propagator::process_reduce(Node& node, StagePlan& sp) {
+    auto& results = executor_.mutable_results();
+    auto& stage_values = executor_.mutable_stage_values();
+    NodeExecutionResult& res = results[node.id];
+    const NodeExecutionResult& in_res = results[node.inputs[0]];
+    res.is_collection = false;
+    sp.ops_total = in_res.collection_val.size();
+
+    uint64_t in_hash = in_res.hash();
+    uint64_t init_hash = node.init ? hash_expr_ir(node.init.get()) : 0;
+
+    if (executor_.enable_memo() && node.memo.reduce_memo.valid &&
+        node.memo.reduce_memo.inputHash == in_hash &&
+        node.memo.reduce_memo.fnHash == node.fnHash &&
+        node.memo.reduce_memo.initHash == init_hash) {
+        sp.ops_reused = sp.ops_total;
+        sp.status = StagePlanStatus::REUSED;
+        res.scalar_val = node.memo.reduce_memo.result;
+        return;
+    }
+
+    sp.ops_evaluated = sp.ops_total;
+    sp.status = StagePlanStatus::FULL;
+    sp.note = "(reduce is O(n) in v1)";
+
+    BytecodeCompiler init_comp;
+    auto init_prog = init_comp.compile(node.init.get());
+    Value acc = VM::execute(init_prog, {}, stage_values);
+    if (node.fn.has_value()) {
+        BytecodeCompiler fn_comp(node.fn->params);
+        auto fn_prog = fn_comp.compile(node.fn->body.get());
+        for (const auto& item : in_res.collection_val) {
+            acc = VM::execute(fn_prog, {acc, item.value}, stage_values);
+        }
+    }
+    res.scalar_val = acc;
+    if (executor_.enable_memo()) {
+        node.memo.reduce_memo = ReduceMemoEntry{in_hash, node.fnHash, init_hash, acc, true};
+    }
+}
+
+void Propagator::process_tree_reduce(Node& node, WorkSet& ws, StagePlan& sp) {
+    auto& results = executor_.mutable_results();
+    auto& stage_values = executor_.mutable_stage_values();
+    NodeExecutionResult& res = results[node.id];
+    const NodeExecutionResult& in_res = results[node.inputs[0]];
+    const Collection& col = in_res.collection_val;
+    res.is_collection = false;
+    sp.ops_total = col.size();
+
+    uint64_t in_hash = in_res.hash();
+    uint64_t init_hash = node.init ? hash_expr_ir(node.init.get()) : 0;
+    auto& memo = node.memo.tree_reduce_memo;
+
+    static const std::unordered_set<RecordId> no_records;
+    auto pend_it = ws.pending.find(node.id);
+    const auto& changed_recs = (pend_it == ws.pending.end()) ? no_records : pend_it->second;
+
+    bool can_incremental = (use_record_memo() && memo.valid &&
+                            ws.full_scan.count(node.id) == 0 &&
+                            memo.fnHash == node.fnHash && memo.initHash == init_hash &&
+                            memo.num_leaves == col.size() && !changed_recs.empty() &&
+                            col.size() > 1);
+    // Every changed record must still map to the same leaf; otherwise the leaf
+    // layout is stale and the tree is rebuilt.
+    if (can_incremental) {
+        for (auto rid : changed_recs) {
+            if (memo.record_to_leaf.find(rid) == memo.record_to_leaf.end() ||
+                find_record(col, rid) == nullptr) {
+                can_incremental = false;
+                break;
+            }
+        }
+    }
+
+    if (can_incremental) {
+        BytecodeCompiler fn_comp(node.fn->params);
+        auto fn_prog = fn_comp.compile(node.fn->body.get());
+
+        std::unordered_set<size_t> dirty_at_level;
+        for (auto rid : changed_recs) {
+            size_t leaf_idx = memo.record_to_leaf[rid];
+            memo.tree[leaf_idx] = find_record(col, rid)->value;
+            if (leaf_idx > 1) {
+                dirty_at_level.insert(leaf_idx / 2);
+            }
+        }
+
+        // Ascend to the root: at most ceil(log2 n) combiner steps per change
+        while (!dirty_at_level.empty()) {
+            std::unordered_set<size_t> next_level;
+            for (size_t idx : dirty_at_level) {
+                size_t left_child = 2 * idx;
+                size_t right_child = 2 * idx + 1;
+                if (memo.active[left_child] && memo.active[right_child]) {
+                    sp.ops_evaluated++;
+                    memo.tree[idx] = VM::execute(fn_prog, {memo.tree[left_child], memo.tree[right_child]}, stage_values);
+                    memo.active[idx] = true;
+                } else if (memo.active[left_child]) {
+                    memo.tree[idx] = memo.tree[left_child];
+                    memo.active[idx] = true;
+                } else if (memo.active[right_child]) {
+                    memo.tree[idx] = memo.tree[right_child];
+                    memo.active[idx] = true;
+                }
+                if (idx > 1) {
+                    next_level.insert(idx / 2);
+                }
+            }
+            dirty_at_level = std::move(next_level);
+        }
+
+        sp.ops_reused = sp.ops_total > sp.ops_evaluated ? (sp.ops_total - sp.ops_evaluated) : 0;
+        sp.status = StagePlanStatus::PARTIAL;
+        sp.note = "(tree_reduce O(log n) update)";
+        memo.result = memo.tree[1];
+        memo.inputHash = in_hash;
+        res.scalar_val = memo.tree[1];
+        return;
+    }
+
+    BytecodeCompiler init_comp;
+    auto init_prog = init_comp.compile(node.init.get());
+    Value init_val = VM::execute(init_prog, {}, stage_values);
+    size_t n = col.size();
+    sp.status = StagePlanStatus::FULL;
+
+    if (n == 0) {
+        res.scalar_val = init_val;
+        return;
+    }
+
+    BytecodeCompiler fn_comp(node.fn->params);
+    auto fn_prog = fn_comp.compile(node.fn->body.get());
+    if (n == 1) {
+        sp.ops_evaluated = 1;
+        res.scalar_val = VM::execute(fn_prog, {init_val, col[0].value}, stage_values);
+        return;
+    }
+
+    sp.ops_evaluated = n - 1;
+    size_t m = 1;
+    while (m < n) m <<= 1;
+
+    memo.leaf_offset = m;
+    memo.num_leaves = n;
+    memo.tree.assign(2 * m, Value());
+    memo.active.assign(2 * m, false);
+    memo.record_to_leaf.clear();
+
+    for (size_t i = 0; i < n; ++i) {
+        size_t leaf_idx = m + i;
+        memo.tree[leaf_idx] = col[i].value;
+        memo.active[leaf_idx] = true;
+        memo.record_to_leaf[col[i].id] = leaf_idx;
+    }
+
+    for (size_t i = m - 1; i >= 1; --i) {
+        size_t left_child = 2 * i;
+        size_t right_child = 2 * i + 1;
+        if (memo.active[left_child] && memo.active[right_child]) {
+            memo.tree[i] = VM::execute(fn_prog, {memo.tree[left_child], memo.tree[right_child]}, stage_values);
+            memo.active[i] = true;
+        } else if (memo.active[left_child]) {
+            memo.tree[i] = memo.tree[left_child];
+            memo.active[i] = true;
+        } else if (memo.active[right_child]) {
+            memo.tree[i] = memo.tree[right_child];
+            memo.active[i] = true;
+        } else {
+            memo.active[i] = false;
+        }
+    }
+
+    res.scalar_val = memo.tree[1];
+    memo.result = memo.tree[1];
+    memo.inputHash = in_hash;
+    memo.fnHash = node.fnHash;
+    memo.initHash = init_hash;
+    memo.valid = true;
+}
+
+void Propagator::process_join(Node& node, StagePlan& sp) {
+    auto& results = executor_.mutable_results();
+    auto& stage_values = executor_.mutable_stage_values();
+    NodeExecutionResult& res = results[node.id];
+    const auto& left_res = results[node.inputs[0]];
+    const auto& right_res = results[node.inputs[1]];
+    res.is_collection = true;
+    sp.ops_total = left_res.collection_val.size() + right_res.collection_val.size();
+    sp.status = StagePlanStatus::FULL;
+
+    uint64_t ka_hash = node.fn ? hash_lambda_ir(*node.fn) : 0;
+    uint64_t kb_hash = node.join_fn_b ? hash_lambda_ir(*node.join_fn_b) : 0;
+
+    BytecodeCompiler ka_comp(node.fn->params);
+    auto ka_prog = ka_comp.compile(node.fn->body.get());
+    BytecodeCompiler kb_comp(node.join_fn_b->params);
+    auto kb_prog = kb_comp.compile(node.join_fn_b->body.get());
+
+    std::vector<std::pair<Value, const CollectionItem*>> right_keys;
+    right_keys.reserve(right_res.collection_val.size());
+    for (const auto& r_item : right_res.collection_val) {
+        Value key = VM::execute(kb_prog, {r_item.value}, stage_values);
+        sp.ops_evaluated++;
+        right_keys.push_back({std::move(key), &r_item});
+    }
+
+    Collection new_col;
+    RecordId out_id = 0;
+    for (const auto& l_item : left_res.collection_val) {
+        Value l_key = VM::execute(ka_prog, {l_item.value}, stage_values);
+        sp.ops_evaluated++;
+        uint64_t l_hash = l_item.value.hash();
+
+        for (const auto& [r_key, r_item_ptr] : right_keys) {
+            JoinPairKey pair_key{l_item.id, r_item_ptr->id};
+            uint64_t r_hash = r_item_ptr->value.hash();
+
+            if (use_record_memo()) {
+                auto memo_it = node.memo.join_memo.find(pair_key);
+                if (memo_it != node.memo.join_memo.end() &&
+                    memo_it->second.leftHash == l_hash &&
+                    memo_it->second.rightHash == r_hash &&
+                    memo_it->second.kaHash == ka_hash &&
+                    memo_it->second.kbHash == kb_hash) {
+                    if (memo_it->second.matched) {
+                        new_col.push_back(CollectionItem{out_id++, memo_it->second.out});
+                    }
+                    continue;
+                }
+            }
+
+            bool matched = (l_key == r_key);
+            Value out_record;
+            if (matched) {
+                std::vector<RecordField> fields = {
+                    {"left", std::make_shared<Value>(l_item.value)},
+                    {"right", std::make_shared<Value>(r_item_ptr->value)}
+                };
+                out_record = Value::make_record(std::move(fields));
+                new_col.push_back(CollectionItem{out_id++, out_record});
+            }
+            if (use_record_memo()) {
+                node.memo.join_memo[pair_key] = JoinMemoEntry{
+                    l_hash, r_hash, ka_hash, kb_hash, matched, std::move(out_record)
+                };
+            }
+        }
+    }
+    res.collection_val = std::move(new_col);
+    res.rehash_collection();
+}
+
+void Propagator::process_scalar(Node& node, StagePlan& sp) {
+    auto& results = executor_.mutable_results();
+    auto& stage_values = executor_.mutable_stage_values();
+    NodeExecutionResult& res = results[node.id];
+    res.is_collection = false;
+    sp.ops_total = 1;
+
+    uint64_t inputs_hash = 14695981039346656037ULL;
+    for (const auto& in_id : node.inputs) {
+        inputs_hash ^= results[in_id].hash();
+        inputs_hash *= 1099511628211ULL;
+    }
+
+    if (executor_.enable_memo() && node.memo.scalar_memo.valid &&
+        node.memo.scalar_memo.inputsHash == inputs_hash &&
+        node.memo.scalar_memo.fnHash == node.fnHash) {
+        sp.ops_reused = 1;
+        sp.status = StagePlanStatus::REUSED;
+        res.scalar_val = node.memo.scalar_memo.result;
+        return;
+    }
+
+    sp.ops_evaluated = 1;
+    sp.status = StagePlanStatus::FULL;
+    BytecodeCompiler comp;
+    auto prog = comp.compile(node.expr.get());
+    res.scalar_val = VM::execute(prog, {}, stage_values);
+    if (executor_.enable_memo()) {
+        node.memo.scalar_memo = ScalarMemoEntry{inputs_hash, node.fnHash, res.scalar_val, true};
+    }
+}
+
+void Propagator::finish_plan(RebuildPlan& plan, HistoryEntry& hist) {
     for (const auto& sp : plan.stages) {
         plan.recomputed_ops += sp.ops_evaluated;
         plan.reused_ops += sp.ops_reused;
@@ -1944,12 +1101,10 @@ std::variant<RebuildPlan, CompileError> Propagator::apply_delete(const DeleteEdi
         plan.reuse_percent = 0.0;
     }
 
-    hist_entry.ops_recomputed = plan.recomputed_ops;
-    hist_entry.ops_reused = plan.reused_ops;
-    hist_entry.total_memo_bytes = executor_.total_memo_bytes();
-    executor_.get_history().add_entry(std::move(hist_entry));
-
-    return plan;
+    hist.ops_recomputed = plan.recomputed_ops;
+    hist.ops_reused = plan.reused_ops;
+    hist.total_memo_bytes = executor_.total_memo_bytes();
+    executor_.get_history().add_entry(std::move(hist));
 }
 
 std::string Propagator::explain_output(const std::string& output_name) const {

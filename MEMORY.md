@@ -1,7 +1,10 @@
 # MEMORY.md — Running state of the project (update at the end of every session)
 
 ## Current status
-- Current phase: Final Phase complete (Project complete: Report, Demo, and Documentation delivered)
+- Current phase: Post-review improvement 1 of 5 done (remove O(n) rescan in propagation). Next: full benchmark protocol (median of 11, all scenarios, 10k/1M scaling).
+- Last session: 2026-10-28 — Rewrote propagation so work follows changed records; implemented the B1 baseline (it was never implemented); extended difftest. Toolchain now MSYS2 UCRT64 GCC 16.2.0, CMake 4.4.3, Ninja (installed this session; `export PATH=/c/msys64/ucrt64/bin:$PATH`).
+- Tests (2026-10-28): 8/8 CTest suites pass; 52 doctest cases, 687 assertions; difftest 10,000 trials (seeds 1, 1001, 5001, 20001, 77777 x 2000) pass. Sanitizers NOT run: MinGW GCC has no libasan/libubsan.
+- Previous status: Final Phase complete (Project complete: Report, Demo, and Documentation delivered)
 - Last session: 2026-10-27 — Final phase deliverables complete: authored comprehensive project report (REPORT.md per PRD section 9), created README.md with build and quickstart instructions, created end-to-end sensor-log demo (demo/pipeline.rc, demo/edits.rcs, demo/run_demo.bat, demo/run_demo.sh) running in < 2 seconds, 100% tests passing across all 8 suites.
 - Build: clean (GCC 15.2.0 / MinGW UCRT64, CMake 4.4.4)
 - Tests: 8 passed / 0 failed (100% pass across doctest unit tests (46 cases, 549 assertions), python golden tests, and differential testing runner with 1000 trials)
@@ -21,12 +24,34 @@
 | D-010 | 2026-10-26 | Streamlined benchmark suite iterations & lean batch sizes for fast execution | Running coarse invalidation B1 on 1,000 sequential edits of 100k records causes 14,000 full-pipeline traversals; batching to 10 edits and running 1 warmup + 3 measurements keeps execution times practical (<2 minutes total) while preserving 100% verification across all workloads W1–W4 |
 | D-011 | 2026-10-26 | Tree-reduce complete binary tree array representation (size 2M) and O(log N) ascend | 1-indexed binary reduction tree maps leaves to record ids directly. Single modify edit ascends at most ceil(log2 N) levels; for 1024 items, exactly 10 recomputed ops instead of full 1024 rerun |
 | D-012 | 2026-10-26 | Dynamic overflow spill on FixedVMStack for large array literals | Preserves zero-allocation inline buffer for 99.9% of bytecodes (depth <= 64) while preventing stack overflow on large literals (e.g. 1024 elements) |
+| D-013 | 2026-10-28 | One shared `Propagator::propagate` for modify/insert/delete; MAP/FILTER patch only pending records (binary search by RecordId) when pending <= 1/8 of input, else one full pass; consumers get only records whose output actually changed | Old loops rescanned, rehashed and copied every collection per edit, so 83% op reuse gave ~1.3x wall time |
+| D-014 | 2026-10-28 | Collection hash = f(size, sum of mix(RecordId, valueHash)); kept in `NodeExecutionResult::term_sum` and patched in O(1) | Order-dependent hash forced O(n) rehash per stage per edit; collections are sorted by RecordId (I7) so the (id, value) set fixes the order |
+| D-015 | 2026-10-28 | `stage_values` holds a collection only if an expression reads it (size-only marker when read only via `length`) | Copying every collection into stage_values on every visit was O(n) |
+| D-016 | 2026-10-28 | Insert/delete rollback undoes the exact rewiring instead of cloning graph + results + memos | Clone was O(total memo size) on every structural edit; nothing else is mutated before the topological sort |
+| D-017 | 2026-10-28 | B1 (`stage_invalidation`) now recomputes every record of a dirty MAP/FILTER/JOIN with no per-record memo; REDUCE/SCALAR keep stage-level hash reuse | The flag was stored but never read, so old B1 numbers measured B2 |
+| D-018 | 2026-10-28 | difftest: 5-200 records, 6 pipeline shapes (adds filter chain + length(), branching + tree_reduce, join), 4 insert lambdas | Old generator (5-24 records, 3 shapes) never reached the patch path for most stages; mutation check: dropping one changed-record report fails at trial 16 |
+
+## Benchmarks after D-013..D-017 (2026-10-28, same runner/protocol as before: 1 warm-up + median of 3; noisy machine)
+| Scenario | B0/B2 before | after run 1 | after run 2 |
+|---|---|---|---|
+| W1 E-A modify 1 | 1.28x | 5.78x | 5.06x |
+| W1 E-B modify 10 | 0.29x | 1.26x | 1.30x |
+| W1 E-C insert start | 0.30x | 1.01x | 1.03x |
+| W1 E-D insert end | 1.31x | 4.90x | 5.51x |
+| W1 E-E delete middle | 0.86x | 2.15x | 2.24x |
+| W2 E-A join | 0.22x | 0.20x | 0.22x |
+| W3 E-C insert start | 0.58x | 2.11x | 0.85x (inconclusive) |
+| W4 E-A modify 1 | 1.34x | 3.32x | 3.44x |
+Absolute times varied up to 3x between runs (W1 first run plain: 363 ms vs 1056 ms), so only ratios that held in both runs should be quoted. Raw output was saved to the session scratchpad only, not to the repo.
 
 ## Open questions (for the human)
-- (none yet)
+- Q1 (spec change needed): a lambda that reads another stage (e.g. `map(xs, x => x + total)`) does not list that stage in the node's `inputs` (IR_SPEC section 4 says MAP has 1 input), and the memo key ignores it. A modify that changes `total` leaves stale results: `retroc verify` reports `[25, 8, 9]` vs rerun `[25, 17, 18]`. Pre-existing (same on the original code). Fix needs IR_SPEC to add referenced stages as inputs and include their hashes in the memo key.
+- Q2: `docs/BENCHMARKS.md` result table is stale (its B1 column measured B2). Update it after the full protocol run?
 
 ## Known bugs
-- (none yet)
+- BUG-001 (open): stale results when a lambda reads another stage; see Q1.
+- BUG-002 (fixed 2026-10-28): B1 baseline was never implemented (`stage_invalidation_` unused).
+- BUG-003 (fixed 2026-10-28): tree_reduce incremental path silently skipped changed records missing from `record_to_leaf`; it now rebuilds the tree.
 
 ## Phase checklist
 - [x] Phase 0 setup + spec freeze
@@ -45,9 +70,12 @@
 - [x] Final phase (Report and demo complete)
 
 ## Next actions (exact, small)
-1. Project complete. Push Final Phase deliverables to GitHub.
+1. Item 2 of the review: make bench_runner follow BENCHMARKS.md (3 warm-up + median of 11, report min/max), add E-F and the missing W2-W4 scenarios, W1 at 10k and 1M; save results JSON per run.
+2. Get an answer on Q1 before touching IR/memo keys.
+3. Then: cost model (Phase 12.2), hash-collision bound write-up. B3 baseline deferred by user.
 
 ## Session log (newest first, 2-3 lines each)
+- 2026-10-28: Wrote PROJECT_REPORT.md (rubric-based). Removed the O(n) rescan from propagation (D-013..D-016), implemented B1 (D-017), extended difftest (D-018), added tests/unit/test_incremental.cpp (6 cases). W1 single-record modify went from 1.28x to ~5-6x vs full rerun. Found pre-existing BUG-001 (Q1).
 - 2026-10-27: Final Phase complete. Created `README.md` with full project architecture, build instructions, CLI reference, and benchmark numbers. Authored comprehensive research project report (`REPORT.md`) covering problem, related work, design, edit semantics, tree reduction, benchmark results (W1-W4), and correctness verification. Created interactive end-to-end demo (`demo/pipeline.rc`, `demo/edits.rcs`, `demo/run_demo.bat`, `demo/run_demo.sh`) demonstrating initial execution, 3 retroactive edits, automated verification, and output explanation in under 2 seconds. All 8 CTest suites passed 100%.
 - 2026-10-26: Phase 12 Stretch Goal 1 complete. Implemented `tree_reduce` builtin across Sema, IR lowering (`NodeKind::TREE_REDUCE`), Runtime (`GraphExecutor`), and Propagator (`apply_modify`, `apply_insert`, `apply_delete`). Evaluates associative combiners over complete binary reduction trees with leaves mapped to record IDs. Single modify edits propagate strictly in O(log N) operations (e.g., <=10 recomputed ops for N=1024). Updated `FixedVMStack` with dynamic overflow vector to handle large array literals without allocation overhead for small stacks. Added comprehensive unit tests in `tests/unit/test_tree_reduce.cpp`. All 8 CTest suites passed (100% pass, 46 unit test cases, 549 assertions, 1000 diff trials).
 - 2026-10-24: Phase 10 complete. Hardened verifier mode (`verify_edits`) with full-value structural comparison (`Value::operator==`) in addition to string representations. Added failure artifact dumping (`tests/diff/failures/<seed>/` with `seed.txt`, `program.rc`, `edits.rcs`). Added an invalid-edit generator pass into each trial of `difftest` verifying rejection (`E601`) and atomic rollback with unchanged outputs. All 8 CTest suites passed (42 doctest cases, 511 assertions; 1000/1000 diff trials passed).

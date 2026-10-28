@@ -109,6 +109,15 @@ using Collection = std::vector<CollectionItem>;
 // "shortest round-trip decimal, always with a . (e.g. 3.0, 0.25)"
 std::string format_float(double val);
 
+// Collection hash = f(size, sum of per-record terms). The sum is commutative, so
+// replacing, adding or removing one record updates it in O(1) instead of
+// rehashing the whole collection. Order is still captured: RecordIds are unique
+// and collections are sorted by RecordId (I7), so the (id, value) set determines
+// the sequence.
+uint64_t collection_item_term(RecordId id, uint64_t value_hash);
+uint64_t collection_hash_from_sum(uint64_t term_sum, size_t size);
+uint64_t collection_term_sum(const Collection& col);
+
 // Hash a collection directly without copying elements into a Value::ARRAY
 uint64_t hash_collection(const Collection& col);
 

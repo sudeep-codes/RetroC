@@ -10,15 +10,36 @@
 
 namespace retroc {
 
+struct NodeExecutionResult;
+
+// How expressions in the graph read a stage by name (LOAD_STAGE). Collections
+// are expensive to materialize as a Value, so we only do it when needed.
+enum class StageRefUse { NONE, LENGTH_ONLY, FULL };
+using StageRefMap = std::unordered_map<std::string, StageRefUse>;
+
+// Scans every fn/init/expr in the graph. Names absent from the map are never read.
+StageRefMap analyze_stage_refs(const Graph &graph);
+
+// Stores res under name in stage_values according to how it is read.
+// Scalars are always stored (cheap); collections only when referenced.
+void store_stage_value(std::unordered_map<std::string, Value> &stage_values,
+                       const StageRefMap &refs, const std::string &name,
+                       const NodeExecutionResult &res);
+
 struct NodeExecutionResult {
   bool is_collection = false;
   Collection collection_val;
   Value scalar_val;
+  // Sum of collection_item_term over collection_val. Whoever changes
+  // collection_val must keep it current (rehash_collection or an O(1) patch).
+  uint64_t term_sum = 0;
 
-  // Fast hash without constructing a temporary Value::make_array
+  void rehash_collection() { term_sum = collection_term_sum(collection_val); }
+
+  // O(1) for collections thanks to the maintained term_sum
   uint64_t hash() const {
     if (is_collection) {
-      return hash_collection(collection_val);
+      return collection_hash_from_sum(term_sum, collection_val.size());
     }
     return scalar_val.hash();
   }
@@ -140,6 +161,7 @@ private:
       stage_values_; // stage name -> single Value
   std::vector<std::pair<std::string, std::string>> outputs_;
   HistoryLog history_;
+  StageRefMap stage_refs_; // computed at the start of run()
 };
 
 } // namespace retroc

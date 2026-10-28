@@ -6,6 +6,52 @@
 
 namespace retroc {
 
+static void scan_stage_refs(const ExprIR* expr, const std::vector<std::string>& params,
+                            StageRefMap& refs) {
+    if (!expr) return;
+    BytecodeCompiler compiler(params);
+    BytecodeProgram prog = compiler.compile(expr);
+    for (size_t i = 0; i < prog.code.size(); ++i) {
+        if (prog.code[i].op != Opcode::LOAD_STAGE) continue;
+        const std::string& name = prog.stage_names[prog.code[i].arg];
+        bool length_only = (i + 1 < prog.code.size() &&
+                            prog.code[i + 1].op == Opcode::BUILTIN_LENGTH_ARRAY);
+        auto& use = refs[name];
+        if (!length_only) {
+            use = StageRefUse::FULL;
+        } else if (use == StageRefUse::NONE) {
+            use = StageRefUse::LENGTH_ONLY;
+        }
+    }
+}
+
+StageRefMap analyze_stage_refs(const Graph& graph) {
+    StageRefMap refs;
+    for (const auto& [id, node] : graph.nodes) {
+        if (node.fn) scan_stage_refs(node.fn->body.get(), node.fn->params, refs);
+        if (node.join_fn_b) scan_stage_refs(node.join_fn_b->body.get(), node.join_fn_b->params, refs);
+        scan_stage_refs(node.init.get(), {}, refs);
+        scan_stage_refs(node.expr.get(), {}, refs);
+    }
+    return refs;
+}
+
+void store_stage_value(std::unordered_map<std::string, Value>& stage_values,
+                       const StageRefMap& refs, const std::string& name,
+                       const NodeExecutionResult& res) {
+    if (!res.is_collection) {
+        stage_values[name] = res.scalar_val;
+        return;
+    }
+    auto it = refs.find(name);
+    if (it == refs.end() || it->second == StageRefUse::NONE) {
+        return;
+    }
+    // LENGTH_ONLY: BUILTIN_LENGTH_ARRAY reads the size from int_val, so we
+    // avoid copying every record just to answer length(c).
+    stage_values[name] = (it->second == StageRefUse::FULL) ? res.as_value() : res.as_stage_value();
+}
+
 size_t GraphExecutor::total_memo_bytes() const {
     size_t total = 0;
     for (const auto& [id, node] : graph_.nodes) {
@@ -22,6 +68,7 @@ void GraphExecutor::run(std::ostream* output_stream) {
     HistoryEntry entry;
     entry.edit_id = 0; // 0 represents initial run
     entry.description = "initial run";
+    stage_refs_ = analyze_stage_refs(graph_);
 
     // Invariant I1: graph_.order is a valid topological order
     for (const auto& node_id : graph_.order) {
@@ -197,7 +244,7 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
             const auto& input_res = results_[node.inputs[0]];
             res.is_collection = false;
 
-            uint64_t input_hash = input_res.as_value().hash();
+            uint64_t input_hash = input_res.hash();
             uint64_t init_hash = node.init ? hash_expr_ir(node.init.get()) : 0;
 
             // Invariant I3: check memo for REDUCE
@@ -233,7 +280,7 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
             const auto& input_res = results_[node.inputs[0]];
             res.is_collection = false;
 
-            uint64_t input_hash = input_res.as_value().hash();
+            uint64_t input_hash = input_res.hash();
             uint64_t init_hash = node.init ? hash_expr_ir(node.init.get()) : 0;
 
             if (enable_memo_ && node.memo.tree_reduce_memo.valid &&
@@ -411,7 +458,7 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
             // Compute combined hash of input stage values
             uint64_t inputs_hash = 14695981039346656037ULL;
             for (const auto& in_id : node.inputs) {
-                inputs_hash ^= results_[in_id].as_value().hash();
+                inputs_hash ^= results_[in_id].hash();
                 inputs_hash *= 1099511628211ULL;
             }
 
@@ -443,8 +490,12 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
         }
     }
 
+    if (res.is_collection) {
+        res.rehash_collection();
+    }
+
     // Invariant I4: version increases iff outHash changes
-    uint64_t new_out_hash = res.as_value().hash();
+    uint64_t new_out_hash = res.hash();
     if (new_out_hash != node.outHash || node.version == 0) {
         node.version += 1;
         node.outHash = new_out_hash;
@@ -452,8 +503,11 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
     // Invariant I5: after execution/propagation, status is CLEAN
     node.status = NodeStatus::CLEAN;
 
-    // Save stage value for downstream stages that refer to this stage by name
-    stage_values_[node.name] = res.as_value();
+    // Save stage value for downstream stages that refer to this stage by name.
+    // OUTPUT nodes share their source stage's name and value, so skip them.
+    if (node.kind != NodeKind::OUTPUT) {
+        store_stage_value(stage_values_, stage_refs_, node.name, res);
+    }
     results_[node.id] = std::move(res);
 }
 

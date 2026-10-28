@@ -71,9 +71,48 @@ public:
     void set_stage_invalidation(bool val) { stage_invalidation_ = val; }
 
 private:
+    // Work set for one edit (EDIT_SEMANTICS.md section 6).
+    struct WorkSet {
+        EditKind edit_kind = EditKind::MODIFY;
+        NodeId new_stage;                                    // inserted node, if any
+        std::unordered_set<NodeId> dirty;                    // nodes to visit
+        std::unordered_set<NodeId> full_scan;                // MAP/FILTER: check every record
+        std::unordered_map<NodeId, std::unordered_set<RecordId>> pending; // changed input records
+    };
+
+    using ConsumerIndex = std::unordered_map<NodeId, std::vector<NodeId>>;
+
+    // Shared propagation loop for all three edit kinds. Visits dirty nodes in
+    // topological order, fills plan stages and the history entry.
+    void propagate(WorkSet& ws, RebuildPlan& plan, HistoryEntry& hist);
+
+    void process_map_filter(Node& node, WorkSet& ws, StagePlan& sp,
+                            std::vector<RecordId>& changed_out);
+    void process_reduce(Node& node, StagePlan& sp);
+    void process_tree_reduce(Node& node, WorkSet& ws, StagePlan& sp);
+    void process_join(Node& node, StagePlan& sp);
+    void process_scalar(Node& node, StagePlan& sp);
+
+    // Marks consumers of node dirty; record-tracking consumers get changed_out
+    // as pending records, the rest are rescanned.
+    void mark_consumers(const Node& node, const ConsumerIndex& consumers, WorkSet& ws,
+                        const std::vector<RecordId>* changed_out);
+    void seed_consumer(const NodeId& consumer, WorkSet& ws, const std::vector<RecordId>* records);
+
+    // Makes sure every stage an expression reads is present in stage_values
+    // (an inserted lambda may read a stage nobody read before).
+    void refresh_stage_values();
+
+    void finish_plan(RebuildPlan& plan, HistoryEntry& hist);
+
+    bool use_record_memo() const { return executor_.enable_memo() && !stage_invalidation_; }
+
     Graph& graph_;
     GraphExecutor& executor_;
+    // B1 baseline (BENCHMARKS.md): stage-level invalidation. Any change to a
+    // stage's input recomputes the whole stage; no per-record memo or work set.
     bool stage_invalidation_ = false;
+    StageRefMap stage_refs_;
 };
 
 } // namespace retroc
