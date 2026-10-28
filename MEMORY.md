@@ -1,7 +1,8 @@
 # MEMORY.md — Running state of the project (update at the end of every session)
 
 ## Current status
-- Current phase: Post-review improvement 1 of 5 done (remove O(n) rescan in propagation). Next: full benchmark protocol (median of 11, all scenarios, 10k/1M scaling).
+- Current phase: Post-review improvements 1-2 of 5 done (O(n) rescan removed; full benchmark protocol run, results in bench/published/2026-10-28/, 6593 s, 35 scenarios, all verify PASS). Next: cost model (Phase 12.2).
+- Full-protocol headline (pinned P-core, median of 11): E-A modify 1 record B0/B2 = 9.63x (W1-10k), 9.87x (100k), 10.05x (1M), 22.39x (W3), 3.37x (W4-1M). B1/B2 on modifies 9-20x. Losses: E-B batches 0.03-0.23x, W2 joins 0.02-0.40x, insert near start 0.71-1.06x. Structural edits: B2 is 0.64-0.98x of B1 (C2 not supported). First-run overhead +42.7% (W1-100k).
 - Last session: 2026-10-28 — Rewrote propagation so work follows changed records; implemented the B1 baseline (it was never implemented); extended difftest. Toolchain now MSYS2 UCRT64 GCC 16.2.0, CMake 4.4.3, Ninja (installed this session; `export PATH=/c/msys64/ucrt64/bin:$PATH`).
 - Tests (2026-10-28): 8/8 CTest suites pass; 52 doctest cases, 687 assertions; difftest 10,000 trials (seeds 1, 1001, 5001, 20001, 77777 x 2000) pass. Sanitizers NOT run: MinGW GCC has no libasan/libubsan.
 - Previous status: Final Phase complete (Project complete: Report, Demo, and Documentation delivered)
@@ -30,6 +31,11 @@
 | D-016 | 2026-10-28 | Insert/delete rollback undoes the exact rewiring instead of cloning graph + results + memos | Clone was O(total memo size) on every structural edit; nothing else is mutated before the topological sort |
 | D-017 | 2026-10-28 | B1 (`stage_invalidation`) now recomputes every record of a dirty MAP/FILTER/JOIN with no per-record memo; REDUCE/SCALAR keep stage-level hash reuse | The flag was stored but never read, so old B1 numbers measured B2 |
 | D-018 | 2026-10-28 | difftest: 5-200 records, 6 pipeline shapes (adds filter chain + length(), branching + tree_reduce, join), 4 insert lambdas | Old generator (5-24 records, 3 shapes) never reached the patch path for most stages; mutation check: dropping one changed-record report fails at trial 16 |
+| D-019 | 2026-10-28 | bench_runner follows BENCHMARKS.md: 3 warm-up + median of 11 (min/max kept); a system whose single run exceeds 10 s gets 1 warm-up + 5 runs, marked n=5 | Spec protocol; the cap keeps the 1M-record runs from taking hours |
+| D-020 | 2026-10-28 | B0, B2, B1 are timed round-robin, process pinned to one performance core (`--cpu 2`, high priority) | i7-13620H is hybrid: same work ran ~2x slower on an E-core (CPU 14); sequential timing let thermal drift bias the ratios |
+| D-021 | 2026-10-28 | Scenarios E-A..E-F for W1 (10k, 100k, 1M), W2, W3, W4 (1M, per spec); E-B = 1% of records capped at 100 edits; W1-1M E-B skips B1; W4 has no E-E | Edits apply one at a time and B1 recomputes the pipeline per edit; uncapped 1% at 1M under B1 would take days; deleting `mapped` in W4 changes the type |
+| D-022 | 2026-10-28 | W2 stays 500 users / 2,000 orders (spec: 50k/200k) | JOIN is a nested loop, so 50k x 200k = 10^10 comparisons is not runnable |
+| D-023 | 2026-10-28 | B0 for a modify on a CSV input runs on a patched copy of the cached CSV collection | Previously B0 reran the unedited data for CSV modifies |
 
 ## Benchmarks after D-013..D-017 (2026-10-28, same runner/protocol as before: 1 warm-up + median of 3; noisy machine)
 | Scenario | B0/B2 before | after run 1 | after run 2 |
@@ -70,9 +76,9 @@ Absolute times varied up to 3x between runs (W1 first run plain: 363 ms vs 1056 
 - [x] Final phase (Report and demo complete)
 
 ## Next actions (exact, small)
-1. Item 2 of the review: make bench_runner follow BENCHMARKS.md (3 warm-up + median of 11, report min/max), add E-F and the missing W2-W4 scenarios, W1 at 10k and 1M; save results JSON per run.
-2. Get an answer on Q1 before touching IR/memo keys.
-3. Then: cost model (Phase 12.2), hash-collision bound write-up. B3 baseline deferred by user.
+1. Get an answer on Q1 (stage refs in lambdas) and Q2 (copy bench/published/2026-10-28 numbers into docs/BENCHMARKS.md) before touching docs/ or IR.
+2. Cost model (Phase 12.2): per edit batch / per stage choose recompute vs patch; targets E-B batches, W2 joins, insert-near-start. Re-run full protocol after (`bench_runner bench/data bench/results --cpu 2 --machine "..."`, ~1h50m).
+3. Hash-collision bound write-up. B3 baseline deferred by user.
 
 ## Session log (newest first, 2-3 lines each)
 - 2026-10-28: Wrote PROJECT_REPORT.md (rubric-based). Removed the O(n) rescan from propagation (D-013..D-016), implemented B1 (D-017), extended difftest (D-018), added tests/unit/test_incremental.cpp (6 cases). W1 single-record modify went from 1.28x to ~5-6x vs full rerun. Found pre-existing BUG-001 (Q1).
