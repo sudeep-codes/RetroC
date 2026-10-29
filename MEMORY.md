@@ -6,7 +6,7 @@
 - Tests (2026-10-29): 8/8 CTest suites; doctest 65 cases, 1,097 assertions; difftest 10,000 trials (seeds 1, 1001, 5001, 20001, 77777 x 2000) pass. Sanitizers NOT run (MinGW has no libasan/libubsan).
 - Toolchain: MSYS2 UCRT64 GCC 16.2.0, CMake, Ninja (`export PATH=/c/msys64/ucrt64/bin:$PATH`).
 - Paper: paper/RetroC_IEEE_paper_final.docx/.pdf (12 pages, 9 figures, 20 refs, 4 authors) built by paper/build_paper.py from the published JSON; README.md and REPORT.md updated to the same numbers.
-- Uncommitted: all of the above. Last pushed commit 5720aa0.
+- All code, results, paper and docs committed and pushed in 692bbdf. Working tree clean: stale untracked files deleted on user request (FINAL_REVIEW_REPORT.md with old numbers, superseded paper/RetroC_IEEE_paper.docx/.pdf, tests/diff/failures/ dumps that all pass `retroc verify` now).
 
 ## Decisions (append only; include the reason)
 | ID | Date | Decision | Reason |
@@ -90,11 +90,11 @@ Absolute times varied up to 3x between runs (W1 first run plain: 363 ms vs 1056 
 - [x] Final phase (Report and demo complete)
 
 ## Next actions (exact, small)
-1. Ask the user whether to commit and push the final code, results, paper and docs on perf/incremental-propagation.
-2. Get answers on Q3 (reword "(reduce is O(n) in v1)" note; spec + golden change) and Q4 (document in-place join patch in EDIT_SEMANTICS §6).
-3. Future work only (not scheduled): Phases 12.4-12.6, real datasets, external baseline.
+1. Get answers on Q3 (reword "(reduce is O(n) in v1)" note; spec + golden change) and Q4 (document in-place join patch in EDIT_SEMANTICS §6).
+2. Future work only (not scheduled): Phases 12.4-12.6, real datasets, external baseline.
 
 ## Session log (newest first, 2-3 lines each)
+- 2026-10-29 (night): Checked WIP: no tracked file was modified; 692bbdf is pushed. Re-ran ctest 8/8, doctest 65/1,097, difftest 10,000 trials: all pass. Replayed the 5 saved failure dumps: all verify OK (stale). Deleted the stale untracked leftovers on user request.
 - 2026-10-29 (late): Final benchmark run (5448 s); all 35 scenarios faster than full rerun, W4 E-F at parity with B1 (0.98x). Added join in-place patch unit test (65 cases). Paper text made data-driven for the B1 claim; figures, docx, PDF, README, REPORT regenerated from bench/published/2026-10-29.
 - 2026-10-29: IEEE paper in paper/ (build_paper.py, 20 refs, 3 authors). Pitch deck (19 slides, speaker notes) as a claude.ai artifact. Rewrote demo/prof_demo.ps1 (no hardcoded numbers, MSYS2 PATH, optional -Bench W1-10k run, ~50 s) and demo/DEMO_WALKTHROUGH.md (current numbers, run order, Q&A); clarified comments in demo/edits.rcs. Demo runs end to end; ctest 8/8 pass. README.md/REPORT.md still quote old 10.9x.
 - 2026-10-28: Wrote PROJECT_REPORT.md (rubric-based). Removed the O(n) rescan from propagation (D-013..D-016), implemented B1 (D-017), extended difftest (D-018), added tests/unit/test_incremental.cpp (6 cases). W1 single-record modify went from 1.28x to ~5-6x vs full rerun. Found pre-existing BUG-001 (Q1).
