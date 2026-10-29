@@ -9,7 +9,8 @@ Node {
   id        : NodeId        // unique, never reused, even after deletion
   name      : string        // stage name from source; inserted stages get names from the edit
   kind      : INPUT | MAP | FILTER | REDUCE | JOIN | SCALAR | OUTPUT
-  inputs    : [NodeId]      // ordered; MAP/FILTER/REDUCE: 1; JOIN: 2; SCALAR: 0..n (referenced stages)
+  inputs    : [NodeId]      // ordered; first the iterated collections (MAP/FILTER/REDUCE/TREE_REDUCE: 1; JOIN: 2; SCALAR: 0),
+                            // then every stage that fn/init/expr reads by name (e.g. `total` in `x => x + total`)
   fn        : ExprIR*       // lambda body (MAP/FILTER/REDUCE/JOIN keys); null for INPUT/OUTPUT
   init      : ExprIR*       // REDUCE initial value
   expr      : ExprIR*       // SCALAR expression
@@ -36,15 +37,15 @@ Graph { nodes: map<NodeId, Node>, order: [NodeId] (topological), outputs: [NodeI
 | INPUT | 0 | holds records with RecordIds | none |
 | MAP | 1 collection | out[r] = fn(in[r]) | `RecordId -> {inHash, fnHash, out}` |
 | FILTER | 1 collection | keep r if fn(in[r]) | `RecordId -> {inHash, fnHash, keep}` |
-| JOIN | 2 collections | equi-join on key fns | key index for both sides; pair-level memo |
-| REDUCE | 1 collection | left fold | `{inputHash, fnHash, initHash, result}` |
+| JOIN | 2 collections | equi-join on key fns (hash join; output in left order, then right order) | key index for both sides (`RecordId -> {inHash, keyFnHash, key}`); pair-level memo for matched pairs |
+| REDUCE | 1 collection | left fold | `{inputHash, fnHash, initHash, result}`; additive int folds (`(a, x) => a + t(x)`, t reads neither `a` nor a stage) also keep `RecordId -> t(x)` and the term sum |
 | SCALAR | stages | evaluate expr | `{inputsHash, fnHash, result}` |
 | OUTPUT | 1 stage | print | none |
 
 ## 5. Invariants (reference these in code comments)
 - I1: The graph is a DAG; `order` is a valid topological order.
 - I2: NodeIds are unique and never reused.
-- I3: A memo entry may be reused only if its `inHash` AND `fnHash` match the current ones.
+- I3: A memo entry may be reused only if its `inHash` AND `fnHash` match the current ones. For a node that reads stages by name, the memo key is `fnHash` combined with the `outHash` of each such stage, so a change to a referenced stage invalidates every entry of the node.
 - I4: `version` increases iff `outHash` changes.
 - I5: After propagation, every node has status CLEAN and its output equals the pure function of its current inputs.
 - I6: Every node type-checks against its inputs (checked after every edit; failure rejects the edit).

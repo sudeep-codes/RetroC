@@ -278,37 +278,13 @@ static int edit_cmd(const std::string& prog_path, const std::string& edits_path)
     retroc::Propagator propagator(graph, executor);
 
     for (const auto& edit_ptr : script.edits) {
-        if (edit_ptr->kind() == retroc::EditKind::MODIFY) {
-            const auto& mod_edit = static_cast<const retroc::ModifyEdit&>(*edit_ptr);
-            auto plan_res = propagator.apply_modify(mod_edit);
-            if (std::holds_alternative<retroc::CompileError>(plan_res)) {
-                const auto& err = std::get<retroc::CompileError>(plan_res);
-                std::cerr << err.format() << std::endl;
-                return 2; // Exit code 2: invalid edit per ARCHITECTURE.md
-            }
-            const auto& plan = std::get<retroc::RebuildPlan>(plan_res);
-            std::cout << plan.to_string();
-        } else if (edit_ptr->kind() == retroc::EditKind::INSERT) {
-            const auto& ins_edit = static_cast<const retroc::InsertEdit&>(*edit_ptr);
-            auto plan_res = propagator.apply_insert(ins_edit);
-            if (std::holds_alternative<retroc::CompileError>(plan_res)) {
-                const auto& err = std::get<retroc::CompileError>(plan_res);
-                std::cerr << err.format() << std::endl;
-                return 2; // Exit code 2: invalid edit per ARCHITECTURE.md
-            }
-            const auto& plan = std::get<retroc::RebuildPlan>(plan_res);
-            std::cout << plan.to_string();
-        } else if (edit_ptr->kind() == retroc::EditKind::DELETE) {
-            const auto& del_edit = static_cast<const retroc::DeleteEdit&>(*edit_ptr);
-            auto plan_res = propagator.apply_delete(del_edit);
-            if (std::holds_alternative<retroc::CompileError>(plan_res)) {
-                const auto& err = std::get<retroc::CompileError>(plan_res);
-                std::cerr << err.format() << std::endl;
-                return 2; // Exit code 2: invalid edit per ARCHITECTURE.md
-            }
-            const auto& plan = std::get<retroc::RebuildPlan>(plan_res);
-            std::cout << plan.to_string();
+        auto plan_res = propagator.apply_edit(*edit_ptr);
+        if (std::holds_alternative<retroc::CompileError>(plan_res)) {
+            const auto& err = std::get<retroc::CompileError>(plan_res);
+            std::cerr << err.format() << std::endl;
+            return 2; // Exit code 2: invalid edit per ARCHITECTURE.md
         }
+        std::cout << std::get<retroc::RebuildPlan>(plan_res).to_string();
     }
 
     // Print final outputs
@@ -408,30 +384,11 @@ static int explain_cmd(const std::string& prog_path, const std::string& edits_pa
     retroc::Propagator propagator(graph, executor);
 
     for (const auto& edit_ptr : script.edits) {
-        if (edit_ptr->kind() == retroc::EditKind::MODIFY) {
-            const auto& mod_edit = static_cast<const retroc::ModifyEdit&>(*edit_ptr);
-            auto plan_res = propagator.apply_modify(mod_edit);
-            if (std::holds_alternative<retroc::CompileError>(plan_res)) {
-                const auto& err = std::get<retroc::CompileError>(plan_res);
-                std::cerr << err.format() << std::endl;
-                return 2;
-            }
-        } else if (edit_ptr->kind() == retroc::EditKind::INSERT) {
-            const auto& ins_edit = static_cast<const retroc::InsertEdit&>(*edit_ptr);
-            auto plan_res = propagator.apply_insert(ins_edit);
-            if (std::holds_alternative<retroc::CompileError>(plan_res)) {
-                const auto& err = std::get<retroc::CompileError>(plan_res);
-                std::cerr << err.format() << std::endl;
-                return 2;
-            }
-        } else if (edit_ptr->kind() == retroc::EditKind::DELETE) {
-            const auto& del_edit = static_cast<const retroc::DeleteEdit&>(*edit_ptr);
-            auto plan_res = propagator.apply_delete(del_edit);
-            if (std::holds_alternative<retroc::CompileError>(plan_res)) {
-                const auto& err = std::get<retroc::CompileError>(plan_res);
-                std::cerr << err.format() << std::endl;
-                return 2;
-            }
+        auto plan_res = propagator.apply_edit(*edit_ptr);
+        if (std::holds_alternative<retroc::CompileError>(plan_res)) {
+            const auto& err = std::get<retroc::CompileError>(plan_res);
+            std::cerr << err.format() << std::endl;
+            return 2;
         }
     }
 

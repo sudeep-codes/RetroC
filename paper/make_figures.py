@@ -13,7 +13,8 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import FancyBboxPatch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-RESULTS = os.path.join(ROOT, "bench", "published", "2026-10-28", "benchmark_results.json")
+RESULTS = os.environ.get("RETROC_RESULTS") or os.path.join(
+    ROOT, "bench", "published", "2026-10-29", "benchmark_results.json")
 OUT = os.path.join(ROOT, "paper", "figures")
 os.makedirs(OUT, exist_ok=True)
 
@@ -78,50 +79,79 @@ def label_bars(ax, bars, values, fmt="{:.1f}×"):
 
 # --- Fig. 1: architecture ----------------------------------------------------
 def fig_architecture():
-    fig, ax = plt.subplots(figsize=(COL_W, 3.5))
-    ax.set_xlim(0, 10)
-    ax.set_ylim(0, 11)
+    W, H = 10.0, 13.6
+    fig, ax = plt.subplots(figsize=(COL_W, COL_W * H / W))
+    ax.set_xlim(0, W)
+    ax.set_ylim(0, H)
     ax.axis("off")
+    FRONT, CORE, EDIT, OUTC = "#eef4fc", "#fdf0ea", "#e8f7f1", "#f3f2ee"
 
-    def box(x, y, w, h, text, fill="#eef4fc", bold=False):
-        ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0.02,rounding_size=0.15",
+    def box(x, y, w, h, title, sub=None, fill=FRONT, bold=False):
+        ax.add_patch(FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0,rounding_size=0.12",
                                     linewidth=0.7, edgecolor=INK2, facecolor=fill))
-        ax.text(x + w / 2, y + h / 2, text, ha="center", va="center", fontsize=6.5,
-                color=INK, fontweight="bold" if bold else "normal", linespacing=1.15)
+        if sub:
+            ax.text(x + w / 2, y + h * 0.66, title, ha="center", va="center", fontsize=6.4, color=INK,
+                    fontweight="bold" if bold else "normal")
+            ax.text(x + w / 2, y + h * 0.30, sub, ha="center", va="center", fontsize=5.5, color=INK2,
+                    linespacing=1.1)
+        else:
+            ax.text(x + w / 2, y + h / 2, title, ha="center", va="center", fontsize=6.4, color=INK,
+                    fontweight="bold" if bold else "normal")
 
-    def arrow(x1, y1, x2, y2):
+    def arrow(x1, y1, x2, y2, style="-|>", dashed=False):
         ax.annotate("", xy=(x2, y2), xytext=(x1, y1),
-                    arrowprops=dict(arrowstyle="-|>", lw=0.7, color=INK2, mutation_scale=7))
+                    arrowprops=dict(arrowstyle=style, lw=0.7, color=INK2, mutation_scale=7,
+                                    linestyle=(0, (3, 2)) if dashed else "-", shrinkA=0, shrinkB=0))
 
-    # front end
-    ax.text(0.1, 10.6, "Compiler front end", fontsize=6.5, color=INK2, style="italic")
-    front = ["Lexer", "Parser", "Sema", "IR builder"]
-    for i, t in enumerate(front):
-        box(0.1 + i * 2.5, 9.2, 2.1, 1.0, t)
+    def lane(y, h, label):
+        ax.add_patch(FancyBboxPatch((0.05, y), W - 0.1, h, boxstyle="round,pad=0,rounding_size=0.15",
+                                    linewidth=0.5, edgecolor=GRID, facecolor="none", linestyle=(0, (3, 2))))
+        ax.text(W - 0.25, y + h - 0.25, label, ha="right", va="center", fontsize=6, color=INK2,
+                style="italic")
+
+    # lane 1: front end
+    lane(10.3, 3.2, "compile (once)")
+    ax.text(0.3, 12.95, "program.rc", fontsize=5.8, color=INK2, family="DejaVu Sans Mono")
+    names = [("Lexer", "tokens"), ("Parser", "AST"), ("Sema", "types, purity"), ("IR builder", "versioned DAG")]
+    for i, (t, sub) in enumerate(names):
+        box(0.3 + i * 2.38, 10.9, 2.0, 1.6, t, sub)
         if i:
-            arrow(0.1 + i * 2.5 - 0.4, 9.7, 0.1 + i * 2.5, 9.7)
-    ax.text(0.1, 8.75, "program.rc", fontsize=6, color=INK2)
+            arrow(0.3 + i * 2.38 - 0.38, 11.7, 0.3 + i * 2.38, 11.7)
 
-    box(2.6, 7.2, 4.8, 1.2, "Retroactive IR\n(versioned DAG, memo tables)", fill="#fdf0ea", bold=True)
-    arrow(8.65, 9.2, 6.6, 8.4)
+    # lane 2: core
+    lane(5.9, 4.1, "run")
+    box(2.4, 8.2, 5.2, 1.45, "Retroactive IR", "nodes, reference inputs,\nversions, hashes, memo tables",
+        fill=CORE, bold=True)
+    arrow(8.4, 10.9, 6.8, 9.65)
+    box(0.3, 6.2, 4.4, 1.5, "Bytecode compiler + VM", "lambdas to stack code")
+    box(5.3, 6.2, 4.4, 1.5, "Graph executor", "first run, memo fill,\nhash join, sum terms")
+    arrow(3.5, 8.2, 2.5, 7.7)
+    arrow(6.5, 8.2, 7.5, 7.7)
+    arrow(4.7, 6.95, 5.3, 6.95)
 
-    box(0.1, 5.3, 4.3, 1.2, "Bytecode compiler\n+ stack VM")
-    box(5.6, 5.3, 4.3, 1.2, "Graph executor\n(first run, memo fill)")
-    arrow(3.6, 7.2, 2.3, 6.5)
-    arrow(6.4, 7.2, 7.7, 6.5)
-    arrow(4.4, 5.9, 5.6, 5.9)
+    # lane 3: edits
+    lane(1.95, 3.65, "edit (repeat)")
+    ax.text(1.25, 5.15, "edits.rcs", fontsize=5.8, color=INK2, family="DejaVu Sans Mono")
+    box(0.3, 2.45, 4.4, 2.45, "Edit engine",
+        "modify record\ninsert / delete stage\ninsert / delete record\ntype-check, undo on error",
+        fill=EDIT)
+    box(5.3, 2.45, 4.4, 2.45, "Propagator",
+        "work set of record IDs\ncost model: patch or\nfull pass, early cutoff,\nO(1) collection hash",
+        fill=EDIT, bold=True)
+    arrow(4.7, 3.67, 5.3, 3.67)
+    arrow(7.5, 6.2, 7.5, 4.9)
+    # edits rewrite the IR: routed along the left margin, clear of the VM box
+    ax.plot([0.9, 0.9, 0.17, 0.17, 1.6], [4.9, 5.35, 5.35, 8.92, 8.92], color=INK2, lw=0.7,
+            linestyle=(0, (3, 2)))
+    arrow(1.6, 8.92, 2.4, 8.92, dashed=True)
+    ax.text(0.3, 8.6, "rewrite", fontsize=5.4, color=INK2, style="italic", ha="left")
 
-    box(0.1, 3.3, 4.3, 1.2, "Edit engine\n(rewrite, type-check, undo)")
-    ax.text(0.1, 2.85, "edits.rcs", fontsize=6, color=INK2)
-    box(5.6, 3.3, 4.3, 1.2, "Propagator\n(work set, early cutoff)", fill="#e8f7f1", bold=True)
-    arrow(4.4, 3.9, 5.6, 3.9)
-    arrow(7.75, 5.3, 7.75, 4.5)
-
-    box(0.1, 0.6, 3.0, 1.3, "Updated\noutputs")
-    box(3.5, 0.6, 3.0, 1.3, "Rebuild plan\n+ explain")
-    box(6.9, 0.6, 3.0, 1.3, "Verifier\n(full rerun, compare)")
-    for x in (1.6, 5.0, 8.4):
-        arrow(7.75, 3.3, x, 1.9)
+    # outputs
+    outs = [("Updated outputs", None), ("Rebuild plan", "+ explain"), ("Verifier", "full rerun, compare")]
+    for i, (t, sub) in enumerate(outs):
+        x = 0.3 + i * 3.25
+        box(x, 0.15, 2.95, 1.35, t, sub, fill=OUTC)
+        arrow(7.5, 2.45, x + 1.47, 1.5)
     save(fig, "fig1_architecture.png")
 
 
@@ -132,15 +162,16 @@ def fig_single_edit():
     vals = [ratio(k, "E-A") for k in keys]
     fig, ax = plt.subplots(figsize=(COL_W, 1.9))
     bars = ax.bar(range(len(vals)), vals, width=0.6, color=B2, edgecolor="white", linewidth=0.8)
-    ax.axhline(1.0, color=INK2, linewidth=0.7, linestyle="--")
-    ax.text(-0.45, max(vals) * 1.1, "dashed line: full rerun (1×)", fontsize=6, color=INK2,
-            ha="left", va="center")
-    label_bars(ax, bars, vals, "{:.2f}×")
+    ax.set_yscale("log")
+    for b, v in zip(bars, vals):
+        ax.text(b.get_x() + b.get_width() / 2, v * 1.25, f"{v:,.0f}×", ha="center", va="bottom",
+                fontsize=6.3, color=INK)
     ax.set_xticks(range(len(vals)))
     ax.set_xticklabels(labels)
     ax.set_ylabel("Speedup over full rerun (B0/B2)")
-    ax.set_ylim(0, max(vals) * 1.18)
+    ax.set_ylim(1, max(vals) * 6)
     style_axes(ax)
+    ax.yaxis.set_major_formatter(matplotlib.ticker.FuncFormatter(lambda v, _: f"{v:,.0f}×"))
     save(fig, "fig2_single_edit.png")
 
 
@@ -186,7 +217,8 @@ def fig_scaling():
         ax.plot(sizes, ys, color=color, linewidth=1.4, linestyle=ls, marker=marker, markersize=4,
                 markeredgecolor="white", markeredgewidth=0.6, label=name)
         dy = {"b0": 5, "b1": -5}.get(sys_key, 0)
-        ax.annotate(f"{ys[-1]:,.0f} ms", (sizes[-1], ys[-1]), xytext=(5, dy), textcoords="offset points",
+        lbl = f"{ys[-1]:,.0f} ms" if ys[-1] >= 1 else f"{ys[-1]:.2f} ms"
+        ax.annotate(lbl, (sizes[-1], ys[-1]), xytext=(5, dy), textcoords="offset points",
                     va="center", fontsize=6, color=INK)
     ax.set_xscale("log")
     ax.set_yscale("log")
@@ -334,18 +366,19 @@ def fig_flowchart():
     cur[0] = a_bot - 0.3
     b_top = cur[0]
     cur[0] -= 0.55
-    main("read", "io", "Read the next edit from edits.rcs", 0.55, 6, link=False)
+    main("read", "io", "Read the next edit (modify, or\ninsert/delete a stage or record)", 0.75, 6, link=False)
     arrow(CX, nodes["out"]["bot"], CX, nodes["read"]["top"])
     main("apply", "proc", "Snapshot graph; apply the edit;\nre-sort stages (Kahn); type-check",
          0.75, 7)
     main("valid", "dec", "Edit valid?", 0.8)
     side_from("valid", "rollback", "Roll back to the\nsnapshot; report E601", 0.6, "no")
-    main("seed", "proc", "Seed work set W: dirty stages\nand pending record IDs", 0.75, 8, label="yes")
+    main("seed", "proc", "Seed W with changed record IDs;\nstages read by name: full scan", 0.75, 8,
+         label="yes")
     main("visit", "proc", "Visit the next dirty stage v\nin topological order", 0.75, 9)
-    main("big", "dec", "Pending > n/8?", 0.8)
-    side_from("big", "full", "One full pass,\nmemo check per record", 0.6, "yes")
-    main("patch", "proc", "Patch pending records (binary\nsearch); rerun lambda on memo miss",
-         0.75, 10, label="no")
+    main("big", "dec", "Cost model:\npatch cheaper?", 1.05)
+    side_from("big", "full", "One full pass; memo\noff if lookups miss", 0.6, "no")
+    main("patch", "proc", "Patch only changed records (binary\nsearch; int sums swap one term)",
+         0.75, 10, label="yes")
     main("hash", "proc", "Update collection hash in O(1)", 0.55, 11)
     f = nodes["full"]
     path([(SX, f["bot"]), (SX, nodes["hash"]["yc"]), (CX + BW / 2, nodes["hash"]["yc"])])
@@ -377,7 +410,61 @@ def fig_flowchart():
     save(fig, "fig2_flowchart.png")
 
 
+# --- Fig. 3: performance matrix ------------------------------------------------
+def fig_matrix():
+    import numpy as np
+    from matplotlib.colors import LinearSegmentedColormap, TwoSlopeNorm
+    work = [("W1-10k", "W1 10k"), ("W1-100k", "W1 100k"), ("W1-1M", "W1 1M"),
+            ("W2", "W2 join"), ("W3", "W3 12 st."), ("W4", "W4 1M")]
+    edits = ["E-A", "E-B", "E-C", "E-D", "E-E", "E-F"]
+    heads = ["modify\n1", "modify\nbatch", "insert\nstart", "insert\nend", "delete\nmiddle", "insert\nidentity"]
+    # light grey at parity, deepening green with speedup; slowdowns would be orange
+    cmap = LinearSegmentedColormap.from_list("speed", ["#eb6834", "#f6f5f1", "#1baf7a", "#0d6b4a"],
+                                             N=256)
+    # colour by log2(speedup): parity (1x) is the neutral midpoint
+    norm = TwoSlopeNorm(vmin=-2.0, vcenter=0.0, vmax=6.0)
+    fig, axes = plt.subplots(2, 1, figsize=(COL_W, 4.1))
+    for ax, (num, title) in zip(axes, [("b0", "Speedup over full rerun (B0 / B2)"),
+                                       ("b1", "Speedup over stage-level reuse (B1 / B2)")]):
+        m = np.full((len(work), len(edits)), np.nan)
+        for i, (w, _) in enumerate(work):
+            for j, e in enumerate(edits):
+                if (w, e) in rows:
+                    v = ratio(w, e, num, "b2")
+                    if v is not None:
+                        m[i, j] = v
+        ax.imshow(np.log2(np.where(np.isnan(m), 1.0, m)), cmap=cmap, norm=norm, aspect="auto")
+        for i in range(len(work)):
+            for j in range(len(edits)):
+                v = m[i, j]
+                if np.isnan(v):
+                    ax.add_patch(plt.Rectangle((j - 0.5, i - 0.5), 1, 1, facecolor="#e4e3df",
+                                               edgecolor="white", hatch="////", linewidth=0))
+                    ax.text(j, i, "n/a", ha="center", va="center", fontsize=5.6, color=INK2)
+                    continue
+                txt = f"{v:.0f}×" if v >= 100 else (f"{v:.1f}×" if v >= 10 else f"{v:.2f}×")
+                dark = v >= 12
+                ax.text(j, i, txt, ha="center", va="center", fontsize=5.8,
+                        color="white" if dark else INK, fontweight="bold" if v >= 1.0 else "normal")
+        ax.set_xticks(range(len(edits)))
+        ax.set_xticklabels(heads, fontsize=5.6)
+        ax.set_yticks(range(len(work)))
+        ax.set_yticklabels([lbl for _, lbl in work], fontsize=6)
+        ax.tick_params(length=0)
+        ax.set_xticks(np.arange(-0.5, len(edits)), minor=True)
+        ax.set_yticks(np.arange(-0.5, len(work)), minor=True)
+        ax.grid(which="minor", color="white", linewidth=1.2)
+        ax.tick_params(which="minor", length=0)
+        for sp in ax.spines.values():
+            sp.set_visible(False)
+        ax.set_title(title, fontsize=6.8, pad=3)
+        ax.xaxis.tick_top()
+    fig.tight_layout(h_pad=1.0)
+    save(fig, "fig3_matrix.png")
+
+
 fig_flowchart()
+fig_matrix()
 fig_architecture()
 fig_single_edit()
 fig_scenarios("b0", "b2", "Speedup over full rerun", "fig3_scenarios_b0.png")

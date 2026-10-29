@@ -239,7 +239,7 @@ static bool run_trial(size_t trial_idx, uint32_t seed, std::mt19937& rng) {
     src << "];\n";
 
     // Random choice of pipeline structure
-    int pipeline_type = rng() % 6;
+    int pipeline_type = rng() % 7;
     if (pipeline_type == 5) {
         // Second input for the join template: one tag per row id
         src << "input tags: [{ id: int, label: int }] = [\n";
@@ -262,7 +262,9 @@ static bool run_trial(size_t trial_idx, uint32_t seed, std::mt19937& rng) {
         src << "let scaled = map(rows, r => { id: r.id, score: r.v * 2.0, ok: r.ok });\n";
         src << "let passed = filter(scaled, r => r.ok);\n";
         src << "let total = reduce(passed, 0.0, (acc, r) => acc + r.score);\n";
+        src << "let cnt = reduce(passed, 0, (acc, r) => acc + 1);\n";  // additive int sum
         src << "output total;\n";
+        src << "output cnt;\n";
     } else if (pipeline_type == 2) {
         // filter -> map -> output
         src << "let clean = filter(rows, r => r.ok);\n";
@@ -277,7 +279,9 @@ static bool run_trial(size_t trial_idx, uint32_t seed, std::mt19937& rng) {
         src << "let d = map(c, r => { id: r.id, v: r.v + 1.0, ok: r.ok });\n";
         src << "let n = length(d);\n";
         src << "let t = reduce(d, 0.0, (acc, r) => acc + r.v);\n";
+        src << "let k = reduce(d, 5, (acc, r) => acc + r.id * 3);\n";  // additive int sum
         src << "output d;\n";
+        src << "output k;\n";
         src << "output t;\n";
         src << "output n;\n";
     } else if (pipeline_type == 4) {
@@ -287,9 +291,24 @@ static bool run_trial(size_t trial_idx, uint32_t seed, std::mt19937& rng) {
         src << "let s = tree_reduce(w, 0, (x, y) => x + y);\n";
         src << "let hi = filter(a, r => r.ok);\n";
         src << "let m = reduce(hi, 0.0, (acc, r) => acc + r.v);\n";
+        src << "let q = reduce(w, 7, (acc, x) => x * 2 + acc);\n";     // additive, term first
+        src << "let mx = reduce(w, 0, (acc, x) => if x > acc then x else acc);\n"; // not additive
         src << "output s;\n";
+        src << "output q;\n";
+        src << "output mx;\n";
         src << "output m;\n";
         src << "output hi;\n";
+    } else if (pipeline_type == 6) {
+        // lambdas that read other stages by name (reference inputs, BUG-001):
+        // any change to tot or n must reach every record of shifted and big
+        src << "let clean = filter(rows, r => r.ok);\n";
+        src << "let tot = reduce(clean, 0.0, (a, r) => a + r.v);\n";
+        src << "let n = length(clean);\n";
+        src << "let shifted = map(rows, r => { id: r.id, v: r.v + tot, ok: r.ok });\n";
+        src << "let big = filter(shifted, r => r.v > tot / 2.0 or r.id < n);\n";
+        src << "let s2 = reduce(big, 0, (acc, r) => acc + r.id);\n";
+        src << "output shifted;\n";
+        src << "output s2;\n";
     } else {
         // join: record ids of the join output are renumbered on every change
         src << "let okrows = filter(rows, r => r.ok);\n";
@@ -329,6 +348,11 @@ static bool run_trial(size_t trial_idx, uint32_t seed, std::mt19937& rng) {
         stages.push_back({"a", "row", "row", true});
         stages.push_back({"w", "row", "int", false});  // feeds tree_reduce
         stages.push_back({"hi", "row", "row", false}); // source of output hi
+    } else if (pipeline_type == 6) {
+        // clean is read by name (length), so it cannot be deleted
+        stages.push_back({"clean", "row", "row", false});
+        stages.push_back({"shifted", "row", "row", false}); // source of output shifted
+        stages.push_back({"big", "row", "row", true});
     } else {
         stages.push_back({"okrows", "row", "row", true});
         stages.push_back({"j", "row", "joined", false});
@@ -339,14 +363,41 @@ static bool run_trial(size_t trial_idx, uint32_t seed, std::mt19937& rng) {
     EditScript script;
     int gen_counter = 1;
 
-    for (size_t e = 0; e < num_edits; ++e) {
-        int edit_kind = rng() % 100; // 0..59: modify (60%), 60..79: insert (20%), 80..99: delete (20%)
+    // RecordIds alive in rows: record deletes leave gaps, inserts get fresh ids
+    std::vector<RecordId> live_ids;
+    for (size_t r = 0; r < num_records; ++r) live_ids.push_back(r);
+    RecordId next_id = num_records;
 
-        if (edit_kind < 60) {
+    for (size_t e = 0; e < num_edits; ++e) {
+        // 0..44 modify, 45..59 insert stage, 60..74 delete stage,
+        // 75..87 insert record, 88..99 delete record
+        int edit_kind = rng() % 100;
+
+        if (edit_kind >= 75) {
+            if (edit_kind < 88) {
+                auto ins = std::make_shared<InsertRecordEdit>();
+                ins->input_stage = "rows";
+                double v = static_cast<int>(val_dist(rng) * 10.0) / 10.0;
+                ins->raw_literal_text = "{ id: " + std::to_string(int_dist(rng)) + ", v: " + format_float(v) +
+                                        ", ok: " + (bool_dist(rng) ? "true" : "false") + " }";
+                live_ids.push_back(next_id++);
+                script.edits.push_back(ins);
+            } else if (live_ids.size() > 1) {
+                size_t k = rng() % live_ids.size();
+                auto del = std::make_shared<DeleteRecordEdit>();
+                del->input_stage = "rows";
+                del->record_id = live_ids[k];
+                live_ids.erase(live_ids.begin() + static_cast<long>(k));
+                script.edits.push_back(del);
+            }
+            continue;
+        }
+
+        if (edit_kind < 45) {
             // Modify input record
             auto mod = std::make_shared<ModifyEdit>();
             mod->input_stage = "rows";
-            mod->record_id = rng() % num_records;
+            mod->record_id = live_ids[rng() % live_ids.size()];
 
             int field_choice = rng() % 3;
             if (field_choice == 0) {
@@ -366,7 +417,7 @@ static bool run_trial(size_t trial_idx, uint32_t seed, std::mt19937& rng) {
                 mod->raw_literal_text = std::to_string(new_id);
             }
             script.edits.push_back(mod);
-        } else if (edit_kind < 80) {
+        } else if (edit_kind < 60) {
             // Insert stage before target_stage
             if (!stages.empty()) {
                 size_t target_idx = rng() % stages.size();

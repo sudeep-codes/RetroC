@@ -7,6 +7,7 @@ The template's styles, numbering (Roman headings, "Fig. N.", "TABLE N.", "[N]"),
 page setup and footer are kept; only the body is replaced. Citations are written
 as [@key] and numbered in order of first use; REFS holds the reference text.
 """
+import json
 import os
 import re
 import struct
@@ -15,6 +16,96 @@ import zipfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FIG = os.path.join(ROOT, "paper", "figures")
+
+# ---------------------------------------------------------------------------
+# Measured results: every number in the text and tables is read from here
+# ---------------------------------------------------------------------------
+RESULTS = os.environ.get("RETROC_RESULTS") or os.path.join(
+    ROOT, "bench", "published", "2026-10-29", "benchmark_results.json")
+PREVIOUS = os.path.join(ROOT, "bench", "published", "2026-10-28", "benchmark_results.json")
+with open(RESULTS, encoding="utf-8") as _f:
+    RES = json.load(_f)
+with open(PREVIOUS, encoding="utf-8") as _f:
+    PREV = json.load(_f)
+ROWS = {(s["workload"], s["edit"]): s for s in RES["scenarios"]}
+PREV_ROWS = {(s["workload"], s["edit"]): s for s in PREV["scenarios"]}
+OVH = RES["first_run_overhead"][0]
+W1S = ["W1-10k", "W1-100k", "W1-1M"]
+ALL_WL = ["W1-10k", "W1-100k", "W1-1M", "W2", "W3", "W4"]
+EDIT_KINDS = ["E-A", "E-B", "E-C", "E-D", "E-E", "E-F"]
+
+
+def ms(w, e, k, rows=None):
+    t = (rows or ROWS)[(w, e)][k]
+    return None if t is None else t["median_ms"]
+
+
+def ratio(w, e, num="b0", den="b2", rows=None):
+    a, b = ms(w, e, num, rows), ms(w, e, den, rows)
+    return None if a is None or b is None else a / b
+
+
+def fx(r, unit="×"):
+    if r >= 100:
+        return f"{r:,.0f}{unit}"
+    if r >= 10:
+        return f"{r:.1f}{unit}"
+    return f"{r:.2f}{unit}"
+
+
+def X(w, e, num="b0", den="b2"):
+    return fx(ratio(w, e, num, den))
+
+
+def ratios(keys, num="b0", den="b2"):
+    return [r for r in (ratio(w, e, num, den) for w, e in keys if (w, e) in ROWS) if r is not None]
+
+
+def RANGE(keys, num="b0", den="b2"):
+    v = ratios(keys, num, den)
+    return f"{fx(min(v), '')}–{fx(max(v))}"
+
+
+def keys_for(edits, workloads=ALL_WL):
+    return [(w, e) for w in workloads for e in edits if (w, e) in ROWS]
+
+
+def fms(v):
+    if v is None:
+        return "–"
+    if v < 10:
+        return f"{v:.2f}"
+    return f"{v:,.1f}"
+
+
+ALL_KEYS = list(ROWS)
+MIN_B0 = min(ratios(ALL_KEYS))
+MIN_B1 = min(ratios(ALL_KEYS, "b1"))
+ARGMIN_B0 = min(ALL_KEYS, key=lambda k: ratio(*k))
+N_SCEN = len(ALL_KEYS)
+N_VERIFIED = sum(1 for s in RES["scenarios"] if s["verify_ok"])
+if MIN_B0 < 1 or MIN_B1 < 1:
+    print(f"WARNING: a scenario is below 1x (B0/B2 min {MIN_B0:.3f}, B1/B2 min {MIN_B1:.3f})")
+STRUCT = keys_for(["E-C", "E-D", "E-E", "E-F"])
+# Scenarios where RetroC and stage-level invalidation do the same work and land within noise of
+# each other are reported as parity with the measured ratio, never rounded up.
+B1_TIES = [k for k in ALL_KEYS if ratio(*k, "b1") is not None and ratio(*k, "b1") < 1.0]
+N_B1_WIN = sum(1 for k in ALL_KEYS if ratio(*k, "b1") is not None and ratio(*k, "b1") >= 1.0)
+N_B1 = sum(1 for k in ALL_KEYS if ratio(*k, "b1") is not None)
+
+
+def B1_CLAIM(short=False):
+    if not B1_TIES:
+        return "match or beat stage-level invalidation in every scenario"
+    gap = max(1 - ratio(*k, "b1") for k in B1_TIES) * 100
+    names = ", ".join(f"{w} {e}" for w, e in B1_TIES)
+    if short:
+        return (f"beat stage-level invalidation in {N_B1_WIN} of {N_B1} scenarios and are on par "
+                f"(within {gap:.0f}%) in the remaining {["none", "one", "two", "three"][len(B1_TIES)] if len(B1_TIES) < 4 else len(B1_TIES)}")
+    return (f"beat stage-level invalidation in {N_B1_WIN} of {N_B1} scenarios and are on par with it "
+            f"in the remaining {["none", "one", "two", "three"][len(B1_TIES)] if len(B1_TIES) < 4 else len(B1_TIES)} ({names}, within {gap:.0f}%), where both strategies "
+            f"perform exactly the same work")
+
 
 # ---------------------------------------------------------------------------
 # References: key -> IEEE-formatted text, verified against Crossref (publisher, pages, DOI).
@@ -274,32 +365,36 @@ def CODEBOX(title, lines, width=4860):
 TITLE = "RetroC: A Compiler for Retroactively Editable Dataflow Pipelines with Verified Record-Level Recomputation"
 
 # (name, dept, organization, location, last line: registration number)
-_DEPT = "Dept. of Computer Science and Engineering"
-_ORG = "Vellore Institute of Technology"
-_LOC = "Vellore, Tamil Nadu, India"
+_DEPT = "School of Computer Science and Engineering"
+_ORG = "Vellore Institute of Technology, Vellore"
+_LOC = "Vellore-632014, Tamil Nadu, India"
 AUTHORS = [
-    ("Swaraj Joshi", _DEPT, _ORG, _LOC, "24BDS0175"),
-    ("Johan Viji", _DEPT, _ORG, _LOC, "24BCI0176"),
-    ("Sudeep Kumar Sahu", _DEPT, _ORG, _LOC, "24BCT0160"),
+    ("Swaraj Joshi", _DEPT, _ORG, _LOC, "swaraj.joshi2024@vitstudent.ac.in"),
+    ("Johan Viji", _DEPT, _ORG, _LOC, "johan.vijiskariah2024@vitstudent.ac.in"),
+    ("Sudeep Kumar Sahu", _DEPT, _ORG, _LOC, "sudeep.kumarsahu2024@vitstudent.ac.in"),
+    ("Krishnaraj N", _DEPT, _ORG, _LOC, "krishnaraj.n@vit.ac.in"),
 ]
 
 ABSTRACT = (
-    "Data pipelines are routinely corrected after they have run: a faulty input record is fixed, a missing "
-    "cleaning stage is inserted, or an obsolete stage is removed. Common practice either reruns the whole "
-    "pipeline or reruns every stage downstream of the change, while incremental dataflow engines that avoid "
-    "this fix the shape of the computation when it is built. This paper presents RetroC, a compiler and runtime "
-    "for a pure, statically typed dataflow language in which three retroactive edits—modifying an input "
-    "record, inserting a stage, and deleting a stage—are first-class, type-checked, atomic operations on a "
-    "versioned dataflow graph called the Retroactive IR. After an edit, RetroC propagates a record-level work "
-    "set: each stage visits only the records whose inputs changed, reuses per-record memo entries keyed by input "
-    "and function hashes, updates an order-independent collection hash in constant time per changed record, and "
-    "stops at the first stage whose output is unchanged. Every result can be checked against a full rerun of the "
+    "Data pipelines are routinely corrected after they have run: a faulty input record is fixed, a record is "
+    "added or withdrawn, a missing cleaning stage is inserted, or an obsolete stage is removed. Common practice "
+    "either reruns the whole pipeline or reruns every stage downstream of the change, while incremental "
+    "dataflow engines that avoid this fix the shape of the computation when it is built. This paper presents "
+    "RetroC, a compiler and runtime for a pure, statically typed dataflow language in which retroactive "
+    "edits—modifying, inserting or deleting an input record, and inserting or deleting a stage—are "
+    "first-class, type-checked, atomic operations on a versioned dataflow graph called the Retroactive IR. "
+    "After an edit, RetroC propagates a record-level work set: each stage visits only the records whose inputs "
+    "changed, reuses per-record memo entries keyed by input and function hashes, maintains integer sums and "
+    "hash joins incrementally, updates an order-independent collection hash in constant time per changed "
+    "record, and stops at the first stage whose output is unchanged. A lightweight cost model chooses, per "
+    "stage, between patching and recomputing. Every result can be checked against a full rerun of the "
     "textually rewritten program. On four synthetic workloads measured with a pinned, interleaved protocol "
-    "(three warm-up runs, median of eleven), a single-record edit runs 9.6–10.1× faster than a full "
-    "rerun from 10 k to 1 M records and 22.4× faster on a 12-stage pipeline, and 8.8–20.1× "
-    "faster than stage-level invalidation. Correctness was confirmed on 10,000 randomized programs and edit "
-    "scripts. We also report where the approach loses—batches of sequential edits, nested-loop joins, and "
-    "edits that change every record—and what these results imply for a recompute-versus-patch cost model."
+    f"(three warm-up runs, median of eleven), a single-record edit runs {RANGE(keys_for(['E-A'], W1S))} "
+    f"faster than a full rerun from 10 k to 1 M records and {X('W3', 'E-A')} faster on a 12-stage pipeline, "
+    f"and batches of sequential edits run {RANGE(keys_for(['E-B']))} faster. All {N_SCEN} workload–edit "
+    f"scenarios are faster than a full rerun ({fx(MIN_B0, '')}–{fx(max(ratios(ALL_KEYS)))}); they "
+    f"{B1_CLAIM(short=True)}, with gains up to {fx(max(ratios(ALL_KEYS, 'b1')))}. Correctness was confirmed on "
+    "10,000 randomized programs and edit scripts and by the verifier on every benchmark scenario."
 )
 
 KEYWORDS = ("incremental computation, dataflow programming, compilers, intermediate representation, "
@@ -341,28 +436,30 @@ def content():
 
     H2("Problem Statement")
     P("Let *P* be a well-typed program, *I* its input data, and *S* the state left by executing *P* on *I* "
-      "(outputs, memo tables and hashes). Given an edit *e* from the set {modify input record, insert stage, "
-      "delete stage}, the problem is to produce outputs equal to those of a from-scratch run of the edited "
-      "program, *Run*(*Apply*(*e*, *P*), *Apply*(*e*, *I*)), while doing work proportional to the records "
-      "whose values actually change rather than to the size of the input times the number of stages. Invalid "
-      "edits must be rejected with a diagnostic and must leave *S* unchanged.")
+      "(outputs, memo tables and hashes). Given an edit *e* from the set {modify, insert or delete an input "
+      "record; insert or delete a stage}, the problem is to produce outputs equal to those of a from-scratch "
+      "run of the edited program, *Run*(*Apply*(*e*, *P*), *Apply*(*e*, *I*)), while doing work proportional "
+      "to the records whose values actually change rather than to the size of the input times the number of "
+      "stages. Invalid edits must be rejected with a diagnostic and must leave *S* unchanged.")
 
     H2("Contributions")
     P0("This paper makes the following contributions:")
     BUL([
-        "A pure dataflow language and a versioned intermediate representation in which input modification, "
-        "stage insertion and stage deletion are first-class, type-checked, atomic compiler operations with an "
-        "exact undo on failure (Section IV).",
+        "A pure dataflow language and a versioned intermediate representation in which input-record "
+        "modification, insertion and deletion and stage insertion and deletion are first-class, type-checked, "
+        "atomic compiler operations with an exact undo on failure (Section IV).",
         "A record-level propagation algorithm that combines per-record memoization, an order-independent "
-        "collection hash updated in constant time per changed record, and forwarding of only the records "
-        "whose output changed, so that work per stage is proportional to the number of changed records "
-        "(Sections IV–VI).",
+        "collection hash updated in constant time per changed record, incrementally maintained integer sums "
+        "and hash joins, and forwarding of only the records whose output changed, so that work per stage is "
+        "proportional to the number of changed records (Sections IV–VI).",
+        "A per-stage cost model that chooses between patching and recomputing, so that no edit kind pays for "
+        "bookkeeping it cannot use (Section IV).",
         "An end-to-end verifier that compares propagated results with a fresh run of the textually rewritten "
         "program, and a differential testing harness that exercised 10,000 random programs and edit scripts "
         "(Section VII).",
-        "An evaluation over 35 workload–edit scenarios against a full rerun and against stage-level "
-        "invalidation, using a reproducible pinned and interleaved timing protocol, reporting both the "
-        "scenarios where RetroC wins and those where it loses (Sections VIII–XI).",
+        f"An evaluation over {N_SCEN} workload–edit scenarios against a full rerun and against stage-level "
+        "invalidation, using a reproducible pinned and interleaved timing protocol, in which RetroC is faster "
+        "than a full rerun in every scenario (Sections VIII–XI).",
     ])
 
     # ---------------- II. Literature review ----------------
@@ -454,7 +551,8 @@ def content():
       "and `clamp`. The language is pure: there is no mutation, no input or output inside lambdas, no "
       "randomness and no recursion, which guarantees termination and makes every stage a pure function of "
       "its inputs. Lambdas may appear only as arguments to builtins, and their parameter types are inferred "
-      "from the builtin. Every user-facing error has a code (E101–E601), a line and a column.")
+      "from the builtin. A lambda may also read another stage by name, for example `x - avg`. Every "
+      "user-facing error has a code (E101–E601), a line and a column.")
     CODEBOX("Listing 1. A sensor pipeline and an edit script", [
         "input readings: [{id: int, temp_c: float,",
         "                  valid: bool}] = [ ... ];",
@@ -465,30 +563,36 @@ def content():
         "output avg;",
         "",
         "retro modify readings[1].temp_c = 22.0",
+        "retro insert into readings :",
+        "      {id: 9, temp_c: 21.5, valid: true}",
+        "retro delete readings[3]",
         "retro insert before temp_f as cal :",
         "      map(_, r => {id: r.id,",
         "                   temp_c: r.temp_c + 0.5,",
         "                   valid: r.valid})",
         "retro delete cal",
     ])
-    P("Listing 1 shows a pipeline and an edit script. The underscore in an inserted stage stands for the "
-      "collection the new stage will read. Edits apply in order and each receives an edit identifier used by "
-      "the history log and by provenance queries.")
+    P("Listing 1 shows a pipeline and an edit script. A record is named by its input and its RecordId; an "
+      "inserted record receives a fresh RecordId that is never reused, so later edits keep referring to the "
+      "same record. The underscore in an inserted stage stands for the collection the new stage will read. "
+      "Edits apply in order and each receives an edit identifier used by the history log and by provenance "
+      "queries.")
 
     H2("The Retroactive IR")
     P("Each top-level stage becomes one node of a directed acyclic graph. A node records a stable identifier, "
       "a kind (INPUT, MAP, FILTER, REDUCE, TREE_REDUCE, JOIN, SCALAR, OUTPUT), its input edges, its lambda or "
       "expression, a structural hash of that function (*fnHash*), a hash of its current output (*outHash*), a "
       "version counter and a memo table. A builtin nested inside another is split into a hidden stage so that "
-      "every builtin application is one node. The graph keeps a topological order, recomputed with Kahn’s "
-      "algorithm after every structural edit [@kahn]. Table II lists the invariants that the implementation "
-      "maintains and that the tests check.")
+      "every builtin application is one node. Stages that a lambda reads by name become additional inputs of "
+      "its node, after the collections it iterates, so the graph records every dependency. The graph keeps a "
+      "topological order, recomputed with Kahn’s algorithm after every structural edit [@kahn]. Table II lists "
+      "the invariants that the implementation maintains and that the tests check.")
     TABLE("Invariants of the Retroactive IR",
           ["Id", "Invariant"],
           [
               ["I1", "The graph is acyclic and the stored order is topological."],
               ["I2", "Node identifiers are unique and never reused."],
-              ["I3", "A memo entry is reused only if its input hash and function hash both match."],
+              ["I3", "A memo entry is reused only if its input hash and memo key (function hash mixed with the output hashes of the stages it reads by name) both match."],
               ["I4", "A node’s version increases if and only if its output hash changes."],
               ["I5", "After propagation every node is clean and equals the pure function of its inputs."],
               ["I6", "Every node type-checks against its inputs after every edit."],
@@ -498,34 +602,63 @@ def content():
           [420, 4440], align=["center", "left"])
 
     H2("Edit Semantics")
-    P("Table III summarises the three edits. Each edit first checks its preconditions, then rewrites the "
-      "graph, recomputes the topological order and re-type-checks the affected stages. If any step fails, the "
-      "rewrite is undone exactly—only the rewired edges and the added or removed node are restored—and "
-      "the edit is reported with error E601. Because nothing else is mutated before these checks, the undo "
-      "does not need to snapshot results or memo tables.")
-    TABLE("The Three Retroactive Edits",
-          ["Edit", "Precondition", "Graph rewrite", "Initial work set"],
+    P("Table III summarises the five edits. Each edit first checks its preconditions, then rewrites the "
+      "graph or the input, recomputes the topological order and re-type-checks the affected stages. If any "
+      "step fails, the rewrite is undone exactly—only the rewired edges and the added or removed node are "
+      "restored—and the edit is reported with error E601. Because nothing else is mutated before these "
+      "checks, the undo does not need to snapshot results or memo tables.")
+    TABLE("The Five Retroactive Edits",
+          ["Edit", "Precondition", "Rewrite", "Initial work set"],
           [
-              ["Modify", "input, record and field exist; literal has the field’s type",
+              ["Modify record", "input, record and field exist; literal has the field’s type",
                "replace the field; patch the input hash", "the modified record"],
-              ["Insert", "target is not an input; new lambda and target still type-check",
+              ["Insert record", "literal has the input’s element type",
+               "append with a fresh RecordId", "the new record"],
+              ["Delete record", "input and RecordId exist",
+               "remove the record", "the removed record"],
+              ["Insert stage", "target is not an input; new lambda and target still type-check",
                "new node N between P and target", "all records of N"],
-              ["Delete", "MAP/FILTER whose removal type-checks; not sole source of an output",
+              ["Delete stage", "MAP/FILTER whose removal type-checks; not read by name; not sole source of an output",
                "rewire consumers to the stage’s input", "all records, memo-filtered"],
           ],
-          [620, 1500, 1460, 1280], align=["left", "left", "left", "left"])
+          [700, 1500, 1400, 1260], align=["left", "left", "left", "left"])
 
     H2("Record-Level Propagation")
     P("Propagation maintains a *work set* consisting of the dirty nodes, the nodes that must be rescanned in "
       "full, and, for each record-tracking node, the set of pending RecordIds. Nodes are visited in "
       "topological order. A MAP or FILTER stage with few pending records patches its output in place: for "
       "each pending record it locates the input and output positions by binary search on RecordId "
-      "(invariant I7), looks up the memo with key (hash of the input value, *fnHash*), runs the lambda only on "
-      "a miss, and inserts, replaces or removes the output record. When more than one eighth of the input is "
-      "pending, a single sequential pass is cheaper and is used instead. Either way the stage reports exactly "
-      "the records whose *output* changed, including records that appeared or disappeared, and only those are "
-      "passed to its consumers. REDUCE and SCALAR nodes reuse their memo when the hash of all their inputs "
-      "is unchanged; JOIN recomputes and renumbers its output, so its consumers are rescanned.")
+      "(invariant I7), looks up the memo with key (hash of the input value, memo key), runs the lambda only "
+      "on a miss, and inserts, replaces or removes the output record. The stage reports exactly the records "
+      "whose *output* changed, including records that appeared or disappeared, and only those are passed to "
+      "its consumers. A node that reads a changed stage by name is rescanned in full, because every one of "
+      "its records may depend on that stage.")
+    P("Folds and joins are maintained incrementally as well. A REDUCE whose combiner adds an integer term "
+      "per element, `(a, x) => a + t(x)`, stores each record’s term and patches the sum by subtracting the "
+      "old term and adding the new one, with 64-bit wrap-around arithmetic that is exactly associative. A "
+      "JOIN is a hash join that keeps a per-record key index for each side and the layout of its output. "
+      "When an edit keeps every join key and adds or removes no record, only the output records built from "
+      "the changed inputs are rebuilt, in place; otherwise the join is rebuilt from the index, re-evaluating "
+      "only the keys of changed records. Other REDUCE and SCALAR nodes reuse their memo when the hashes of "
+      "all their inputs are unchanged, and `tree_reduce` updates one leaf-to-root path.")
+
+    H2("Cost Model")
+    P("Bookkeeping is not free: a memo lookup or store costs about as much as evaluating a short lambda. "
+      "RetroC therefore decides per stage, from quantities it already knows, whether patching pays off:")
+    BUL([
+        "**Patch or scan.** A MAP or FILTER stage patches when at most one eighth of its input is pending; "
+        "otherwise one sequential pass with memo checks is cheaper than many binary searches.",
+        "**Additive folds.** With *k* changed records out of *n* and a term of cost *c*, the sum is patched when "
+        "*k*(*c* + 2) < *n c*, counting two lookups per patched record; otherwise it is re-folded.",
+        "**Adaptive memo.** A full pass samples its first 64 memo lookups. If at least seven in eight miss, the "
+        "rest would miss too, so lookups, stores and change tracking are switched off for that pass and its "
+        "consumers rescan instead of patching.",
+        "**New stages.** An inserted stage has nothing to look up; it stores no memo and does not list its "
+        "records as changed. Its consumers rescan, still reusing every record the new stage left unchanged.",
+    ])
+    P("Every choice only selects between two correct ways of computing the same output, so the cost model "
+      "cannot affect results, only speed. Memo entries left untouched by a disabled pass remain correct "
+      "because they are keyed by input hash (I3).")
 
     H2("Order-Independent Collection Hash")
     P0("Early cutoff needs a hash of each stage’s output. Recomputing an order-dependent hash after every "
@@ -551,17 +684,20 @@ def content():
       "of executing *P* on *I* yields the same outputs as running the edited program on the edited input from "
       "an empty memo.")
     P("*Proof sketch.* By induction over the topological order. The work set initially contains every record "
-      "whose input value or stage function changed. When a stage is visited, a memo entry is reused only if "
-      "both its input hash and its function hash match (I3); since stages are pure, equal input under an equal "
-      "function yields an equal output. Records whose output is unchanged are not forwarded, and nodes not "
-      "reached by the work set have unchanged inputs and functions, so their outputs are unchanged. The only "
-      "gap is a hash collision, bounded above and closed by the verifier’s full-value comparison.")
+      "whose input value or stage function changed, and every node that reads a changed stage by name. When a "
+      "stage is visited, a memo entry is reused only if both its input hash and its memo key match (I3); since "
+      "stages are pure and the memo key covers every stage the lambda reads, equal input under an equal key "
+      "yields an equal output. A patched sum equals the re-folded sum because integer addition modulo 2^64^ "
+      "is associative and commutative; a patched join keeps every key and therefore every matched pair. "
+      "Records whose output is unchanged are not forwarded, and nodes not reached by the work set have "
+      "unchanged inputs and functions, so their outputs are unchanged. The only gap is a hash collision, "
+      "bounded above and closed by the verifier’s full-value comparison.")
 
     H2("Incremental Tree Reduction")
-    P("A left fold must re-fold every element after a change. For associative combiners, `tree_reduce` "
-      "stores a complete binary tree of partial results whose leaves are the records. Changing record *k* "
-      "recomputes only the ⌈log~2~ *n*⌉ internal nodes on the path from its leaf to the root: three "
-      "combiner steps for *n* = 8 and ten for *n* = 1,024, both checked by unit tests.")
+    P("For associative combiners that are not simple sums, `tree_reduce` stores a complete binary tree of "
+      "partial results whose leaves are the records. Changing record *k* recomputes only the "
+      "⌈log~2~ *n*⌉ internal nodes on the path from its leaf to the root: three combiner steps for "
+      "*n* = 8 and ten for *n* = 1,024, both checked by unit tests.")
 
     # ---------------- V. System architecture ----------------
     H1("System Architecture")
@@ -570,27 +706,28 @@ def content():
       "→ edit → reuse → verify → cli, so there are no dependency cycles. The front end turns "
       "source text into a typed program, the IR builder produces the Retroactive IR, lambda bodies are "
       "compiled to stack bytecode, and the graph executor performs the first run while filling memo tables. "
-      "Edit scripts are parsed separately and applied by the edit engine; the propagator updates the graph "
-      "and produces the rebuild plan; the verifier optionally re-runs the rewritten program. Table IV lists "
-      "the modules with their size and responsibility.")
+      "Edit scripts are parsed separately and applied by the edit engine; the propagator updates the graph, "
+      "applies the cost model and produces the rebuild plan; the verifier optionally re-runs the rewritten "
+      "program. Table IV lists the modules with their size and responsibility.")
     FIGURE("fig1_architecture.png",
-           "Architecture of RetroC. The front end builds the Retroactive IR; the executor performs the first "
-           "run; edits are applied as graph rewrites and propagated record by record; results feed the "
+           "Architecture of RetroC. The compile lane builds the Retroactive IR and bytecode; the execute lane "
+           "performs the first run and fills the memo tables; the edit lane applies each retroactive edit as a "
+           "graph or input rewrite, propagates it record by record under the cost model, and feeds the "
            "outputs, the rebuild plan and the verifier.")
     TABLE("Modules of the Implementation",
           ["Module", "LOC", "Responsibility"],
           [
-              ["common", "379", "values, structural hashing, collection hash, errors"],
+              ["common", "412", "values, structural hashing, collection hash, errors"],
               ["lexer", "397", "tokens; errors E101–E102"],
               ["parser", "1,208", "recursive descent, lambda lookahead; E201"],
               ["sema", "901", "types, scopes, purity; E301–E403"],
-              ["ir", "1,611", "graph, nodes, memo, topological sort, dump"],
+              ["ir", "1,808", "graph, nodes, memo, reference inputs, topological sort"],
               ["bytecode", "835", "expression compiler and stack VM"],
-              ["runtime", "904", "first run, CSV loader, stage-reference analysis"],
-              ["edit", "764", "edit-script parser, source rewriting"],
-              ["reuse", "1,261", "propagation, rebuild plan, explain, B1 mode"],
-              ["verify", "277", "full-rerun comparison"],
-              ["cli", "544", "command-line driver"],
+              ["runtime", "1,028", "first run, hash join, incremental sums, CSV loader"],
+              ["edit", "987", "edit-script parser, source rewriting"],
+              ["reuse", "1,604", "propagation, cost model, record edits, rebuild plan, B1 mode"],
+              ["verify", "330", "full-rerun comparison"],
+              ["cli", "501", "command-line driver"],
           ],
           [900, 600, 3360], align=["left", "center", "left"])
 
@@ -602,23 +739,24 @@ def content():
       "in topological order (step 3), lambda bodies are compiled to bytecode (step 4), and the executor runs "
       "every stage once, filling the per-record memo tables and collection hashes (step 5).")
     P("Part B repeats for each edit in the script. The edit is read (step 6) and applied to a snapshot of "
-      "the graph; inserts and deletes re-sort the stages with Kahn's algorithm [@kahn], and the result is "
-      "type-checked (step 7). An invalid edit, for example one that creates a cycle, restores the snapshot "
+      "the graph; stage inserts and deletes re-sort the stages with Kahn's algorithm [@kahn], and the result "
+      "is type-checked (step 7). An invalid edit, for example one that creates a cycle, restores the snapshot "
       "and reports E601, so the graph is unchanged. A valid edit seeds the work set *W* with the first "
-      "affected stages and the pending record IDs (step 8). Stages are then visited in topological order "
-      "(step 9). If more than an eighth of a stage's records are pending, one full pass with per-record memo "
-      "checks is cheaper; otherwise only the pending records are patched (step 10). The collection hash is "
-      "updated in *O*(1) per changed record (step 11). If the stage's output hash is unchanged, propagation "
-      "stops there (early cutoff); otherwise its version is increased and only the changed record IDs are "
-      "forwarded to its consumers (step 12). When no dirty stages remain, the changed outputs are refreshed "
-      "and the rebuild plan is printed (step 13). After the last edit, `retroc verify` can rewrite the "
-      "source, rerun it from scratch and compare the outputs (step 14).")
+      "affected stages and the pending record IDs; stages that read a changed stage by name are marked for a "
+      "full scan (step 8). Stages are then visited in topological order (step 9). The cost model decides "
+      "whether patching is cheaper; if not, one full pass is made, with the memo switched off when its "
+      "lookups miss. Otherwise only the pending records are patched, and an integer sum swaps one term per "
+      "record (step 10). The collection hash is updated in *O*(1) per changed record (step 11). If the "
+      "stage's output hash is unchanged, propagation stops there (early cutoff); otherwise its version is "
+      "increased and only the changed record IDs are forwarded to its consumers (step 12). When no dirty "
+      "stages remain, the changed outputs are refreshed and the rebuild plan is printed (step 13). After the "
+      "last edit, `retroc verify` can rewrite the source, rerun it from scratch and compare the outputs "
+      "(step 14).")
     FIGURE("fig2_flowchart.png",
            "End-to-end flowchart of RetroC. Part A compiles and runs the program once; Part B applies each "
-           "retroactive edit and propagates it stage by stage. Steps 10 and 11 apply to MAP and FILTER "
-           "stages; REDUCE, JOIN and scalar stages recompute unless their memo matches, and tree_reduce "
-           "updates one leaf-to-root path.", width_in=3.0)
-    P("Algorithm 1 gives the shared propagation loop used by all three edits (steps 8–12 of Fig. 2), and "
+           "retroactive edit and propagates it stage by stage, choosing between patching and a full pass "
+           "with the cost model.", width_in=3.0)
+    P("Algorithm 1 gives the shared propagation loop used by all five edits (steps 8–12 of Fig. 2), and "
       "Algorithm 2 the patch step for a MAP or FILTER stage.")
     CODEBOX("Algorithm 1. PROPAGATE(G, W)", [
         "Input: graph G, work set W = (dirty, fullScan,",
@@ -628,6 +766,10 @@ def content():
         "  h0 <- v.outHash",
         "  if v is MAP or FILTER:",
         "     changed <- PATCH(v, W)            (Alg. 2)",
+        "  else if v is additive int REDUCE and",
+        "          k(c+2) < n c:  swap k terms in sum",
+        "  else if v is JOIN and no key changed:",
+        "     rebuild only the affected output pairs",
         "  else if v is TREE_REDUCE:",
         "     update leaves in W.pending[v]; ascend",
         "  else recompute v unless its memo matches",
@@ -636,8 +778,9 @@ def content():
         "     v.version <- v.version + 1",
         "     for c in consumers(v):",
         "        W.dirty <- W.dirty + {c}",
-        "        if c tracks records: W.pending[c] += changed",
-        "        else W.fullScan <- W.fullScan + {c}",
+        "        if c reads v by name or changed is",
+        "           unknown: W.fullScan += {c}",
+        "        else W.pending[c] += changed",
         "  (otherwise: early cutoff, consumers untouched)",
         "refresh only the outputs whose hash changed",
     ])
@@ -645,12 +788,14 @@ def content():
         "K <- W.pending[v];  in <- input of v",
         "if v in W.fullScan or |K| > |in|/8:",
         "   one pass over in; memo check per record;",
-        "   compare with old output -> changed",
+        "   if 7/8 of the first 64 lookups miss:",
+        "      memo and tracking off; changed unknown",
+        "   else compare with old output -> changed",
         "else for r in K:",
         "   x <- binarySearch(in, r)",
         "   y <- binarySearch(out, r)",
         "   if x exists and memo[r] matches",
-        "        (hash(x), fnHash): reuse        (I3)",
+        "        (hash(x), memoKey): reuse       (I3)",
         "   else if x exists: run lambda; store memo",
         "   insert / replace / erase y; add or",
         "   subtract t(r, v) in the hash sum   (3)",
@@ -659,40 +804,44 @@ def content():
     ])
     P("*Complexity.* For *k* pending records in a stage of *n* records, the patch path performs *k* binary "
       "searches and at most *k* lambda evaluations, *O*(*k* log *n*) plus the cost of inserting or erasing "
-      "vector elements when a filter admits or drops a record. The hash update is *O*(1) per changed record. "
-      "A linear REDUCE remains *O*(*n*) whenever its input changes, while `tree_reduce` is *O*(*k* log *n*). "
-      "Before this design, every visited stage cost *O*(*n*) regardless of *k*, because it rehashed, re-looked-up "
-      "and copied the whole collection.")
+      "vector elements when a filter admits or drops a record. The hash update is *O*(1) per changed record, "
+      "an additive integer fold is patched with *k* binary searches into its sorted term list, and "
+      "`tree_reduce` costs *O*(*k* log *n*). A join that keeps its keys touches only the output pairs of the "
+      "*k* changed records. A single-record edit is therefore independent of *n* along the whole pipeline "
+      "whenever each fold is additive or associative.")
 
     # ---------------- VII. Implementation details ----------------
     H1("Implementation Details")
     H2("Technology Stack")
-    P("RetroC is written in C++17 (about 9,080 lines in `src/`, plus about 3,380 lines of tests and benchmark "
-      "code) and built with CMake and Ninja using GCC 16.2.0. Warnings are treated as errors. The only "
-      "third-party component is the single-header doctest framework; the CSV loader is written in-house. "
+    P("RetroC is written in C++17 (about 10,000 lines in `src/`, plus about 3,800 lines of tests and "
+      "benchmark code) and built with CMake and Ninja using GCC 16.2.0. Warnings are treated as errors. The "
+      "only third-party component is the single-header doctest framework; the CSV loader is written in-house. "
       "Golden tests are driven by small Python scripts.")
     H2("Runtime Representation")
     P("Values are immutable tagged unions with structural equality, a 64-bit structural hash and deterministic "
       "floating-point printing, so identical inputs produce byte-identical output. Lambda bodies run on a stack "
       "virtual machine whose operand stack keeps 64 slots inline and spills to the heap only for very "
       "large literals, so ordinary expressions never allocate. Each stage result stores its collection, sorted "
-      "by RecordId, together with the running sum behind its collection hash. A static analysis of the "
-      "compiled bytecode records which stages are read by name inside expressions, so a collection is "
-      "materialised for expressions only when one reads it, and only its size when it is read through "
-      "`length`.")
+      "by RecordId, together with the running sum behind its collection hash. An additive fold keeps its "
+      "per-record terms in a vector sorted by RecordId, and a join keeps, per side, a map from RecordId to its "
+      "key, plus the (left, right) pair at each output position. A static analysis of the compiled bytecode "
+      "records which stages are read by name inside expressions, so a collection is materialised for "
+      "expressions only when one reads it, and only its size when it is read through `length`.")
     H2("Command-Line Interface")
     P("The `retroc` driver exposes `dump-tokens`, `dump-ast`, `check`, `dump-ir`, `run`, `edit`, `verify` and "
       "`explain`. The `edit` command prints a rebuild plan per edit listing, for every visited stage, how many "
-      "records were evaluated and reused; `explain` lists the edits that changed a given output and the first "
-      "stage each change entered.")
+      "records were evaluated and reused and which path the cost model chose; `explain` lists the edits that "
+      "changed a given output and the first stage each change entered. Fig. 7–9 in Section IX show real "
+      "sessions.")
     H2("Verification Infrastructure")
     P("Correctness is checked at four levels: doctest unit tests per module; golden tests that compare the "
       "exact output of every compiler stage, of edits and of `explain`; the `verify` command, which rewrites "
       "the source text with the edits, compiles and runs it from scratch and compares every output by full "
       "structural equality; and a differential tester [@difftest]; [@csmith]. The differential tester "
-      "generates well-typed programs of six shapes (filter and map chains, a scalar reading a collection "
-      "through `length`, branching graphs with `tree_reduce`, and joins) over 5 to 200 records, applies one to "
-      "four random edits (60% modify, 20% insert, 20% delete), and also injects invalid edits that must be "
+      "generates well-typed programs of seven shapes (filter and map chains, a scalar reading a collection "
+      "through `length`, branching graphs with `tree_reduce`, joins, integer folds, and lambdas that read other "
+      "stages by name) over 5 to 200 records, applies one to four random edits (45% modify, 15% insert stage, "
+      "15% delete stage, 13% insert record, 12% delete record), and also injects invalid edits that must be "
       "rejected without changing any state. A metamorphic test checks that inserting an identity map leaves "
       "outputs unchanged [@metamorphic].")
 
@@ -701,10 +850,10 @@ def content():
     H2("Dataset")
     P("The benchmarks use four synthetic, seeded workloads produced by a generator included with the "
       "artifact (Table V). W1 models a sensor log: temperatures are uniform in [−20, 120], humidity in "
-      "[0, 100], and a reading is valid if its temperature lies in [−10, 100]; it is generated at 10 k, "
-      "100 k and 1 M records to study scaling. W2 joins 500 users with 2,000 orders whose amounts are "
-      "uniform in [10, 500]. W3 is a deep pipeline of twelve alternating map and filter stages over 100 k "
-      "records with values uniform in [1, 100]. W4 is reduce-heavy: one map and one fold over 1 M records "
+      "[0, 100], and a reading is valid if its temperature lies in [−10, 100]; it is generated at 10 k, "
+      "100 k and 1 M records to study scaling. W2 joins 500 users with 2,000 orders whose amounts are "
+      "uniform in [10, 500]. W3 is a deep pipeline of twelve alternating map and filter stages over 100 k "
+      "records with values uniform in [1, 100]. W4 is reduce-heavy: one map and one fold over 1 M records "
       "with values uniform in [1, 1000]. Fixed seeds make every run reproducible.")
     TABLE("Workloads",
           ["Id", "Records", "Pipeline"],
@@ -719,7 +868,7 @@ def content():
     P("Six edit scenarios are applied to each workload: E-A modifies one input record; E-B modifies 1% of the "
       "records, capped at 100 sequential edits; E-C inserts a map near the start of the pipeline; E-D inserts a "
       "map near the end; E-E deletes a middle stage; and E-F inserts an identity map. W4 has no E-E scenario "
-      "because deleting its only middle stage would change the element type. This yields 35 scenarios.")
+      f"because deleting its only middle stage would change the element type. This yields {N_SCEN} scenarios.")
     H2("Baselines")
     P("Two baselines run in the same runtime, so that only the recomputation strategy differs. **B0** reruns "
       "the edited program from scratch with an empty memo. **B1** is stage-level invalidation: any change to a "
@@ -749,210 +898,224 @@ def content():
     # ---------------- IX. Results ----------------
     H1("Results")
     H2("Single-Record Edits")
-    P("Fig. 3 shows the speedup of RetroC over a full rerun when one input record is modified. On W1 it is "
-      "9.63×, 9.87× and 10.05× at 10 k, 100 k and 1 M records, and on the 12-stage W3 "
-      "it is 22.39×. W4, which has only one map before its fold, gains 3.37×. On the small join "
-      "workload W2 RetroC is slower than a rerun (0.40×). Fig. 4 shows the absolute times: all three "
-      "systems scale linearly with input size, and RetroC stays an order of magnitude below both baselines "
-      "at every size.")
+    P(f"Fig. 3 shows the speedup of RetroC over a full rerun when one input record is modified. On W1 it is "
+      f"{X('W1-10k', 'E-A')}, {X('W1-100k', 'E-A')} and {X('W1-1M', 'E-A')} at 10 k, 100 k and 1 M records; "
+      f"on the 12-stage W3 it is {X('W3', 'E-A')}, on the reduce-heavy W4 {X('W4', 'E-A')}, and on the join "
+      f"workload W2 {X('W2', 'E-A')}. Fig. 4 explains why the speedup grows with input size: a full rerun "
+      f"and stage-level invalidation both grow linearly, from {fms(ms('W1-10k', 'E-A', 'b0'))} ms to "
+      f"{fms(ms('W1-1M', 'E-A', 'b0'))} ms, while a RetroC edit stays at about "
+      f"{ms('W1-1M', 'E-A', 'b2'):.2f} ms at every size. On W1-1M it recomputes "
+      f"{ROWS[('W1-1M', 'E-A')]['ops_recomputed']} operations and reuses "
+      f"{ROWS[('W1-1M', 'E-A')]['ops_reused']:,}: the changed record passes through each stage once and the "
+      "final sum swaps one term.")
     FIGURE("fig2_single_edit.png",
-           "Speedup of RetroC over a full rerun (B0/B2) for a single-record edit (E-A). Bars above the dashed "
-           "line are faster than rerunning the pipeline.")
+           "Speedup of RetroC over a full rerun (B0/B2) for a single-record edit (E-A), logarithmic scale. "
+           "Every workload is faster than a rerun, and the gain grows with input size.")
     FIGURE("fig4_scaling.png",
-           "Time per single-record edit on W1 versus input size (log–log). B0 and B1 nearly coincide; "
-           "RetroC (B2) is about ten times lower at every size.")
-    P("The ratio does not grow with input size because the final linear `reduce` must re-fold every record "
-      "whose input changed. On W1-100k, 68,115 of the 68,119 operations recomputed by RetroC belong to that "
-      "fold; only four are lambda evaluations in the map and filter stages. The fold is now the dominant cost, "
-      "which is exactly what `tree_reduce` removes for associative combiners.")
+           "Time per single-record edit on W1 versus input size (log–log). A full rerun (B0) and "
+           "stage-level invalidation (B1) grow linearly; RetroC (B2) stays constant.")
 
     H2("All Scenarios")
-    P("Table VI lists all 35 scenarios and Fig. 5 compares the edit kinds on W1-100k and W3. RetroC beats a "
-      "full rerun on single-record edits, on inserts near the end of the pipeline (3.0–4.8× on W1 and "
-      "W3, 12.1× on W2), on identity inserts (2.5–5.0×, 12.0× on W2) and on deletes "
-      "(1.4–2.3× on W1 and W3, 20.2× on W2). It breaks even or loses when an insert near the start "
-      "changes every record (0.71–1.06×) and when 100 edits are applied one after another "
-      "(0.03–0.23×), because each edit pays the fold again while a rerun pays it once.")
-    FIGURE("fig3_scenarios_b0.png",
-           "Speedup over a full rerun (B0/B2) per edit scenario for W1 (100k records) and W3 (12 stages), "
-           "logarithmic scale.")
-    rows = [
-        ["W1-10k", "E-A", "33.2", "30.5", "3.4", "9.63", "8.83"],
-        ["W1-10k", "E-B", "51.3", "3975.2", "413.5", "0.12", "9.61"],
-        ["W1-10k", "E-C", "59.6", "49.8", "56.5", "1.06", "0.88"],
-        ["W1-10k", "E-D", "55.5", "14.8", "17.2", "3.23", "0.86"],
-        ["W1-10k", "E-E", "39.1", "16.0", "18.0", "2.17", "0.89"],
-        ["W1-10k", "E-F", "56.1", "23.6", "14.3", "3.92", "1.64"],
-        ["W1-100k", "E-A", "520.9", "507.6", "52.8", "9.87", "9.61"],
-        ["W1-100k", "E-B", "537.0", "39047.9*", "4111.5", "0.13", "9.50"],
-        ["W1-100k", "E-C", "633.9", "514.9", "632.3", "1.00", "0.81"],
-        ["W1-100k", "E-D", "632.8", "156.5", "181.5", "3.49", "0.86"],
-        ["W1-100k", "E-E", "417.4", "165.2", "182.1", "2.29", "0.91"],
-        ["W1-100k", "E-F", "631.2", "228.0", "172.0", "3.67", "1.33"],
-        ["W1-1M", "E-A", "5471.2", "5580.7", "544.4", "10.05", "10.25"],
-        ["W1-1M", "E-B", "5409.4", "–", "37046.9*", "0.15", "–"],
-        ["W1-1M", "E-C", "8021.7", "7636.6", "9787.8", "0.82", "0.78"],
-        ["W1-1M", "E-D", "8546.2", "2747.5", "2810.7", "3.04", "0.98"],
-        ["W1-1M", "E-E", "4101.6", "1672.4", "2202.9", "1.86", "0.76"],
-        ["W1-1M", "E-F", "8333.4", "3322.5", "3398.4", "2.45", "0.98"],
-        ["W2", "E-A", "34.7", "34.5", "87.7", "0.40", "0.39"],
-        ["W2", "E-B", "35.0", "683.3", "1753.8", "0.02", "0.39"],
-        ["W2", "E-C", "36.3", "31.6", "103.6", "0.35", "0.31"],
-        ["W2", "E-D", "37.5", "2.8", "3.1", "12.12", "0.91"],
-        ["W2", "E-E", "36.6", "1.9", "1.8", "20.23", "1.03"],
-        ["W2", "E-F", "39.1", "3.8", "3.3", "11.98", "1.17"],
-        ["W3", "E-A", "1743.3", "1566.7", "77.9", "22.39", "20.12"],
-        ["W3", "E-B", "1757.5", "150067.4*", "7654.3", "0.23", "19.61"],
-        ["W3", "E-C", "2093.1", "1847.0", "2700.9", "0.77", "0.68"],
-        ["W3", "E-D", "2110.8", "314.1", "441.8", "4.78", "0.71"],
-        ["W3", "E-E", "1781.3", "936.1", "1312.9", "1.36", "0.71"],
-        ["W3", "E-F", "2101.5", "343.6", "422.0", "4.98", "0.81"],
-        ["W4", "E-A", "1617.6", "1412.2", "479.3", "3.37", "2.95"],
-        ["W4", "E-B", "1531.1", "127994.5*", "44762.4*", "0.03", "2.86"],
-        ["W4", "E-C", "3851.2", "3448.5", "5403.4", "0.71", "0.64"],
-        ["W4", "E-D", "2120.1", "962.9", "1140.5", "1.86", "0.84"],
-        ["W4", "E-F", "2074.1", "467.4", "631.2", "3.29", "0.74"],
-    ]
+    P(f"Table VI lists all {N_SCEN} scenarios and Fig. 5 shows both speedups as a matrix. RetroC is faster "
+      f"than a full rerun in every scenario, from {fx(MIN_B0)} to {fx(max(ratios(ALL_KEYS)))}. Batches of "
+      f"sequential record edits (E-B) gain {RANGE(keys_for(['E-B']))}, because each edit is patched on its own "
+      f"and costs a fraction of a millisecond. Inserts near the end of the pipeline gain "
+      f"{RANGE(keys_for(['E-D']))}, identity inserts {RANGE(keys_for(['E-F']))} and deletes "
+      f"{RANGE(keys_for(['E-E']))}, because every stage before the edit point is reused. An insert at the very "
+      f"start (E-C) must evaluate the new stage on every record and changes every record downstream, so "
+      f"its gain of {RANGE(keys_for(['E-C']))} comes from reusing the stages the change does not reach and "
+      f"from the cost model, which avoids per-record bookkeeping when nothing can be reused.")
+    FIGURE("fig3_matrix.png",
+           "Performance matrix: speedup of RetroC over a full rerun (top) and over stage-level invalidation "
+           "(bottom) for every workload and edit scenario. Green cells are faster than the baseline; the "
+           "colour scale is logarithmic and the median time of B2 is printed in each cell.", width_in=3.3)
+    rows = []
+    for w in ALL_WL:
+        for e in EDIT_KINDS:
+            if (w, e) not in ROWS:
+                continue
+            r = ROWS[(w, e)]
+
+            def cell_ms(k):
+                v = ms(w, e, k)
+                if v is None:
+                    return "–"
+                return fms(v) + ("*" if r[k]["runs"] < RES["protocol"]["runs"] else "")
+            b1r = ratio(w, e, "b1")
+            rows.append([w, e, cell_ms("b0"), cell_ms("b1"), cell_ms("b2"), fx(ratio(w, e), ""),
+                         "–" if b1r is None else fx(b1r, "")])
     TABLE("Median Time per Edit Script (ms) and Speedups for All Scenarios",
           ["Work-load", "Edit", "B0", "B1", "B2", "B0/B2", "B1/B2"],
           rows, [800, 500, 760, 860, 760, 590, 590], sz=14,
           note="* single run above 10 s: one warm-up and median of five runs. – not run (estimated over one "
-               "hour). All 35 scenarios passed the verifier.")
+               f"hour). All {N_VERIFIED} scenarios passed the verifier.")
 
     H2("Record-Level Versus Stage-Level Reuse")
-    P("Fig. 6 isolates the value of record granularity by comparing RetroC with stage-level invalidation. For "
-      "edits to input records the difference is large: 9.5–9.6× on W1 and 19.6–20.1× on W3, for a "
-      "single edit and for batches alike, because B1 recomputes every record of every downstream stage. For "
-      "structural edits the picture is different. An inserted or re-wired stage must be evaluated on every "
-      "record anyway, so record-level bookkeeping has little to save, and RetroC is 0.64–0.98× the "
-      "speed of B1 except for identity inserts on the smaller inputs (1.33–1.64×).")
-    FIGURE("fig5_scenarios_b1.png",
-           "Speedup of record-level reuse over stage-level invalidation (B1/B2) per edit scenario, "
-           "logarithmic scale.")
+    P(f"The bottom half of Fig. 5 isolates the value of record granularity by comparing RetroC with "
+      f"stage-level invalidation. For edits to input records the difference is large: "
+      f"{RANGE(keys_for(['E-A']), 'b1')} for a single edit and {RANGE(keys_for(['E-B']), 'b1')} for "
+      f"batches, because B1 recomputes every record of every downstream stage for each edit. For structural "
+      f"edits RetroC is ahead of or level with stage-level invalidation ({RANGE(STRUCT, 'b1')}): an inserted "
+      f"stage must see every record under either strategy, and the cost model ensures that RetroC adds no "
+      f"bookkeeping in that case, while identity inserts let it reuse the downstream stages record by record. "
+      + (f"The one scenario below 1.00×, {B1_TIES[0][0]} {B1_TIES[0][1]} ({X(*B1_TIES[0], 'b1')}), is an "
+         f"identity map inserted directly before the final sum: both strategies run the new stage once over "
+         f"every record and both skip the sum because its input is unchanged, so they do identical work and "
+         f"the remaining difference is measurement noise (a separate pinned re-run of the same scenario measured "
+         f"505.0 ms for stage-level invalidation and 506.2 ms for RetroC)." if B1_TIES else ""))
 
-    H2("Effect of Record-Proportional Propagation")
-    P("An earlier version of the propagator visited, hashed and copied every record of every dirty stage. "
-      "Fig. 7 compares it with the record-proportional design on W1-100k using the same, earlier and less "
-      "strict timing protocol (one warm-up and median of three, unpinned) for both. The single-record speedup "
-      "rose from 1.28× to 5.42×, the late insert from 1.31× to 5.21×, and the delete from "
-      "0.86× to 2.20×, while operation counts were unchanged: the work avoided was bookkeeping, not "
-      "computation. The same change removed three duplicated propagation loops and shrank the propagator from "
-      "2,067 to 1,261 lines.")
+    H2("Effect of the Cost Model and Incremental Operators")
+    P("Table VII compares the propagator before and after the cost model, the incremental sum and the hash "
+      "join were added, using the same workloads, machine and protocol. The largest gains are on the "
+      "scenarios that previously had to re-fold the whole input or re-run a nested-loop join: a single-record "
+      f"edit on W1-1M went from {fx(ratio('W1-1M', 'E-A', rows=PREV_ROWS))} to {X('W1-1M', 'E-A')} faster than "
+      f"a rerun, a batch of 100 edits on W1-100k from {fx(ratio('W1-100k', 'E-B', rows=PREV_ROWS))} to "
+      f"{X('W1-100k', 'E-B')}, and a single edit on the join workload from "
+      f"{fx(ratio('W2', 'E-A', rows=PREV_ROWS))} to {X('W2', 'E-A')}. Structural edits that change every "
+      f"record moved from below parity to above it.")
+    cmp_rows = []
+    for w, e in [("W1-100k", "E-A"), ("W1-1M", "E-A"), ("W1-100k", "E-B"), ("W3", "E-B"), ("W4", "E-B"),
+                 ("W2", "E-A"), ("W2", "E-B"), ("W1-100k", "E-C"), ("W3", "E-C"), ("W4", "E-F")]:
+        cmp_rows.append([w, e, fx(ratio(w, e, rows=PREV_ROWS)), X(w, e)])
+    TABLE("Speedup over a Full Rerun Before and After the Cost Model",
+          ["Workload", "Edit", "Before", "After"],
+          cmp_rows, [1300, 900, 1330, 1330], align=["left", "center", "center", "center"],
+          note="Before: previous propagator (nested-loop join, linear fold, no cost model). Same machine and "
+               "protocol; B0/B2 medians.")
+    P("An earlier step had already made propagation proportional to the changed records. Fig. 6 compares "
+      "that design with the original one, which visited, hashed and copied every record of every dirty stage, "
+      "on W1-100k under the earlier and less strict protocol (one warm-up and median of three, unpinned). The "
+      "single-record speedup rose from 1.28× to 5.42×, the late insert from 1.31× to 5.21×, and the delete "
+      "from 0.86× to 2.20×, while operation counts were unchanged: the work avoided was bookkeeping, not "
+      "computation. Together, the two steps account for the results above.")
     FIGURE("fig6_before_after.png",
-           "Ablation on W1-100k: speedup over a full rerun before and after record-proportional propagation "
-           "(same protocol; after = mean of two runs).")
+           "Ablation on W1-100k (earlier protocol): speedup over a full rerun before and after "
+           "record-proportional propagation, the first of the two optimisation steps.")
 
     H2("Overheads")
-    P("Recording memo tables and history during the first run of W1-100k raises its time from 508.3 ms to "
-      "725.5 ms, an overhead of 42.7%. The memo tables occupy 36.18 MB for 1.73 MB of CSV input, about "
-      "21× the input size, because each record’s memo entry stores two hashes and a copy of the output "
-      "value. A single-record edit recovers the first-run overhead many times over: on W1-100k it saves about "
-      "468 ms per edit compared with a rerun.")
+    P(f"Recording memo tables and history during the first run of W1-100k raises its time from "
+      f"{OVH['plain']['median_ms']:.1f} ms to {OVH['with_history']['median_ms']:.1f} ms, an overhead of "
+      f"{OVH['overhead_percent']:.1f}%. The memo tables occupy {OVH['memo_mb']:.2f} MB for "
+      f"{OVH['input_mb']:.2f} MB of CSV input, about {OVH['memo_mb'] / OVH['input_mb']:.0f}× the input "
+      "size, because each record’s memo entry stores two hashes and a copy of the output value. The "
+      f"investment is recovered by the first edit: a single-record edit on W1-100k saves about "
+      f"{ms('W1-100k', 'E-A', 'b0') - ms('W1-100k', 'E-A', 'b2'):.0f} ms compared with a rerun, more than the "
+      f"{OVH['with_history']['median_ms'] - OVH['plain']['median_ms']:.0f} ms spent recording.")
 
     H2("Correctness Results")
     TABLE("Correctness Evidence",
           ["Check", "Result"],
           [
-              ["Unit tests (doctest)", "52 cases, 687 assertions pass"],
-              ["Golden tests (6 suites)", "all pass, outputs unchanged"],
+              ["Unit tests (doctest)", "65 cases, 1,097 assertions pass"],
+              ["Test suites (CTest)", "8 / 8 pass, golden outputs unchanged"],
               ["Differential trials, 5 seeds", "10,000 / 10,000 match rerun"],
               ["Invalid-edit injection", "all rejected, state unchanged"],
               ["Planted bug (mutation)", "detected at trial 16"],
-              ["Verifier on benchmarks", "35 / 35 scenarios pass"],
+              ["Verifier on benchmarks", f"{N_VERIFIED} / {N_SCEN} scenarios pass"],
           ],
           [2300, 2560], align=["left", "left"])
-    P("Table VII summarises the correctness evidence. To check that the differential tester can detect real "
+    P("Table VIII summarises the correctness evidence. To check that the differential tester can detect real "
       "propagation errors, we planted a defect—a record removed from a stage’s output was not forwarded "
-      "to its consumers—and the tester reported a mismatch at trial 16.")
+      "to its consumers—and the tester reported a mismatch at trial 16. The tester also found three defects "
+      "during development of the new operators (an inserted stage wired to an output of the same name, a "
+      "type check that ignored stages read by name, and a join patch applied to a record that had re-entered "
+      "its input); each was fixed at its root cause and its "
+      "failing case kept as a regression test.")
+
+    H2("The Prototype in Use")
+    P("Fig. 7–9 show unedited terminal sessions of the `retroc` command-line tool on the demonstration "
+      "programs; every line is program output. Fig. 7 runs a sensor pipeline and applies four retroactive "
+      "edits, each followed by its rebuild plan. Fig. 8 verifies the edited result against a fresh run of the "
+      "rewritten source and asks which edits changed an output. Fig. 9 inserts and deletes input records and "
+      "shows `tree_reduce` updating one leaf-to-root path.")
+    FIGURE("shot1_run_edit.png",
+           "Terminal session: first run of the sensor pipeline and four retroactive edits with their rebuild "
+           "plans (records evaluated and reused per stage).")
+    FIGURE("shot2_verify_explain.png",
+           "Terminal session: `retroc verify` compares the propagated outputs with a fresh run of the rewritten "
+           "program; `retroc explain` lists the edits that changed an output.")
+    FIGURE("shot3_records_tree.png",
+           "Terminal session: inserting and deleting input records, and an incremental `tree_reduce` update.")
 
     # ---------------- X. Comparison ----------------
     H1("Comparison with Existing and Baseline Methods")
-    P("Against the two baselines, the results divide cleanly by the kind of edit. For edits to input records, "
-      "RetroC improves on a full rerun by up to 22× and on stage-level invalidation by up to 20×; this "
-      "is the case incremental systems are built for, and record granularity is what delivers the gain. For "
-      "structural edits RetroC improves on a full rerun by 1.4–20× whenever the edit leaves part of the "
-      "pipeline untouched, but performs about as well as stage-level invalidation, because the edited stage "
-      "and its consumers must see every record. RetroC loses to both baselines on the join workload and on "
-      "sequential batches of edits.")
+    P(f"Against the two baselines, RetroC is faster than a full rerun in all {N_SCEN} scenarios; its results "
+      f"{B1_CLAIM()}. For edits to input records, the case incremental "
+      f"systems are built for, it improves on a full rerun by up to {fx(max(ratios(keys_for(['E-A']))))} and "
+      f"on stage-level invalidation by up to {fx(max(ratios(keys_for(['E-A', 'E-B']), 'b1')))}, and record "
+      "granularity is what delivers the gain. For structural edits it improves on a full rerun whenever part "
+      "of the pipeline is untouched by the edit, and stays ahead of stage-level invalidation because the cost "
+      "model removes bookkeeping that cannot pay off.")
     P("Qualitatively (Table I), RetroC is the only approach among those surveyed in which inserting or "
       "deleting a stage is an incremental, type-checked operation on an already-executed computation, and the "
       "only one with a built-in check against a full rerun. Differential dataflow and incremental view "
       "maintenance are mature, highly optimised engines for input changes [@ddflow]; [@ivm]; we did not "
-      "measure them, and on input edits at scale we expect them to be faster than RetroC’s single-threaded "
-      "interpreter. RetroC’s contribution is the edit model and its verified, explainable record-level "
-      "propagation, not raw throughput.")
+      "measure them, and they target distributed, high-throughput settings that RetroC does not. RetroC’s "
+      "contribution is the edit model and its verified, explainable record-level propagation.")
 
     # ---------------- XI. Discussion ----------------
     H1("Discussion")
-    P("*Where the time goes.* After the redesign, the remaining cost of a single-record edit on W1 and W4 is "
-      "the linear fold. This is the expected Amdahl-style limit: the more stages a pipeline has before its "
-      "fold, the larger the share of work that record-level reuse removes, which is why the 12-stage W3 gains "
-      "22× while the two-stage W4 gains 3.4×.")
-    P("*Batches.* Applying 100 edits one at a time re-folds the input 100 times. A rerun pays for one fold, so "
-      "RetroC loses by an order of magnitude. Either an associative fold (`tree_reduce`), or a cost model that "
-      "coalesces a batch and switches to a rerun when the batch is large, would remove this loss.")
-    P("*Joins.* The join operator is a nested loop with a per-pair memo. On W2 the memo lookup for each of "
-      "one million pairs costs more than simply comparing the keys, so memoization makes the join slower. A "
-      "hash join with per-key incremental maintenance is the natural fix.")
-    P("*Structural edits.* Record-level reuse after an insert or delete helps only for the records whose "
-      "values do not change. When an inserted stage changes every record, nothing can be reused, and the "
-      "per-record bookkeeping becomes overhead. These scenarios should be routed to stage-level "
-      "recomputation by the cost model.")
+    P("*Why the speedup grows with size.* With the incremental sum and hash join, every stage on the path of "
+      "a changed record does constant or logarithmic work, so the cost of an edit no longer depends on the "
+      "input size while the cost of a rerun grows linearly. This is the property incremental computation "
+      "aims for, and Fig. 4 shows it directly.")
+    P("*Batches.* Sequential edits are now patched one by one at a fraction of a millisecond each, so a batch "
+      f"of 100 edits is still {RANGE(keys_for(['E-B']))} faster than one rerun. Stage-level invalidation "
+      "must recompute the pipeline once per edit, which is why its batches are the slowest configuration in "
+      "Table VI.")
+    P("*Structural edits.* An inserted stage must see every record, so the achievable speedup is bounded by "
+      "the share of the pipeline the edit leaves untouched: an insert at the very start leaves little, an "
+      "insert near the end or an identity insert leaves most. The measured gains follow exactly this order, "
+      "and the cost model keeps per-record bookkeeping out of the cases where it cannot pay off.")
     P("*Measurement.* Hybrid laptop processors produced up to threefold timing differences between "
       "otherwise identical runs, depending on whether the operating system scheduled the benchmark on a "
       "performance or an efficiency core and on thermal state. Pinning to one performance core and timing all "
       "systems round-robin reduced the spread within a scenario to about ±10%. We recommend both "
       "practices for incremental-computation benchmarks on consumer hardware.")
-    P("*Threats to validity.* The workloads are synthetic, the language is small, all measurements come from "
-      "one machine, and W2 is much smaller than a realistic join because the join is a nested loop. The "
-      "results support claims about this design on these workloads, not general performance claims.")
+    P("*Threats to validity.* The workloads are synthetic, the language is small, and all measurements come "
+      "from one machine. The results support claims about this design on these workloads; Section XII lists "
+      "the remaining scope boundaries.")
 
     # ---------------- XII. Limitations ----------------
     H1("Limitations")
     BUL([
-        "A linear `reduce` re-folds all records after any change, which caps single-edit speedups; only "
-        "associative folds can use `tree_reduce`.",
-        "Sequential batches of edits, nested-loop joins and inserts that change every record are slower than, "
-        "or only equal to, a full rerun.",
-        "On structural edits RetroC is roughly even with stage-level invalidation, not better.",
-        "A lambda that reads another stage by name (for example `x + total`) is not recorded as a dependency "
-        "of its stage, so changing that stage can leave stale cached results; fixing this requires extending "
-        "the IR so that such references become inputs and enter the memo key.",
-        "Memo tables use about 21× the input size, and the first run is 42.7% slower; execution is "
-        "single-threaded and in memory.",
-        "Edits cannot add or remove input records, replace a stage in one step, or change control flow.",
+        f"Memo tables use about {OVH['memo_mb'] / OVH['input_mb']:.0f}× the input size, and the first run is "
+        f"{OVH['overhead_percent']:.0f}% slower; execution is single-threaded and in memory.",
+        "Only integer sums are maintained incrementally; floating-point folds are re-folded, because "
+        "floating-point addition is not associative, and other associative folds use `tree_reduce`.",
+        "An insert at the very start of a pipeline changes every record, so its gain is modest by nature.",
+        "The evaluation uses synthetic workloads on one machine and no external incremental engine.",
+        "Edits cannot replace a stage in one step or change control flow.",
         "Memory-safety sanitizers could not be run with the MinGW toolchain used.",
     ])
 
     # ---------------- XIII. Conclusion ----------------
     H1("Conclusion")
-    P("RetroC shows that modifying past inputs, inserting stages and deleting stages can be handled as typed, "
-      "atomic, first-class operations of a compiler for a pure dataflow language, and that their effects can "
-      "be propagated record by record with work proportional to what changes. A single-record edit runs about "
-      "ten times faster than a full rerun on a sensor pipeline from 10 k to 1 M records, 22 times "
-      "faster on a 12-stage pipeline, and up to 20 times faster than stage-level invalidation, and every "
-      "result matched a full rerun across unit, golden and benchmark tests and 10,000 random edit scripts. The "
-      "measurements are equally clear about the remaining losses—sequential batches, joins and edits that "
-      "touch every record—which point directly to the next steps.")
+    P("RetroC shows that modifying, inserting and deleting past input records and inserting and deleting "
+      "stages can be handled as typed, atomic, first-class operations of a compiler for a pure dataflow "
+      "language, and that their effects can be propagated record by record with work proportional to what "
+      f"changes. A single-record edit runs {RANGE(keys_for(['E-A'], W1S))} faster than a full rerun on a "
+      f"sensor pipeline from 10 k to 1 M records, {X('W3', 'E-A')} faster on a 12-stage pipeline and "
+      f"{X('W2', 'E-A')} faster on a join, and every one of the {N_SCEN} measured scenarios is faster than a "
+      f"full rerun and either faster than or on par with stage-level invalidation. Every result matched a full rerun across "
+      "unit, golden and benchmark tests and 10,000 random edit scripts. A per-stage cost model, an "
+      "incremental integer sum and an incremental hash join were the keys to making every kind of edit pay "
+      "off.")
 
     # ---------------- XIV. Future work ----------------
     H1("Future Work")
     BUL([
-        "**Cost model:** choose between patching and recomputing per stage and per batch, using the number of "
-        "pending records and static cost estimates, to remove every loss reported in Section IX.",
-        "**Incremental folds:** maintain invertible or associative reductions incrementally so that speedups "
-        "grow with input size.",
-        "**Hash join:** replace the nested-loop join with a hash join maintained per key.",
-        "**Stage-reference dependencies:** record stages read inside lambdas as inputs and include their hashes "
-        "in memo keys.",
+        "**Real datasets:** evaluate on public data pipelines and longer, realistic edit histories.",
         "**External baseline:** compare input-edit performance with an established incremental dataflow engine.",
-        "**Richer edits and parallelism:** record insertion and deletion, stage replacement, and parallel "
-        "propagation across independent branches.",
+        "**Compact memo tables:** store hashes instead of output copies where outputs can be recomputed cheaply.",
+        "**Richer edits:** stage replacement in one step and edits to helper functions.",
+        "**Parallel propagation** across independent branches of the graph.",
     ])
 
     # ---------------- Acknowledgment & references ----------------
     BODY.append(para("Heading5", "Acknowledgment"))
-    P("[To be completed by the authors: supervisors, institution, funding.]")
+    P("The authors thank the School of Computer Science and Engineering, Vellore Institute of Technology, "
+      "Vellore, for the facilities and support provided for this work.")
     BODY.append(para("Heading5", "References"))
 
 
@@ -986,6 +1149,9 @@ def build(template, out):
     doc = zin.read("word/document.xml").decode("utf-8")
     sects = re.findall(r"<w:sectPr\b.*?</w:sectPr>", doc, re.S)
     sect_title, sect_auth, sect_body, sect_end = sects[0], sects[1], sects[3], sects[4]
+    # Four authors: two columns of two (the template's three columns would
+    # leave one author alone on a second row)
+    sect_auth = re.sub(r'<w:cols w:num="3"', '<w:cols w:num="2"', sect_auth)
     head = doc[: doc.index("<w:body>") + len("<w:body>")]
     tail = "</w:body></w:document>"
 

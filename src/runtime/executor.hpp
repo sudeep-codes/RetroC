@@ -71,6 +71,30 @@ struct NodeExecutionResult {
   }
 };
 
+using StageValues = std::unordered_map<std::string, Value>;
+
+// I3 memo key of node for this run: fnHash mixed with the output hashes of
+// the stages it reads by name, so a change to such a stage misses every memo
+// entry instead of reusing results computed against its old value.
+uint64_t compute_memo_key(const Node &node,
+                          const std::unordered_map<NodeId, NodeExecutionResult> &results);
+
+// Equi-join with a hash index on the right keys (IR_SPEC section 4: key
+// index on both sides, pair-level memo). Output order is left order, then
+// right order, with RecordIds 0, 1, 2, ... exactly as a nested loop gives.
+// With use_memo, a key whose input record hash is unchanged is read from the
+// key index instead of re-running the key lambda. Returns key evaluations.
+size_t execute_join(Node &node, const Collection &left, const Collection &right,
+                    NodeExecutionResult &res, const StageValues &stage_values,
+                    bool use_memo);
+
+// Folds an additive REDUCE (see additive_reduce_term) as init + sum of
+// terms, recording each record's term in node.memo.sum_memo when store_memo.
+// Returns the number of term evaluations (one per record).
+size_t execute_additive_reduce(Node &node, const ExprIR *term, const Collection &in,
+                               NodeExecutionResult &res, const StageValues &stage_values,
+                               bool store_memo);
+
 class GraphExecutor {
 public:
   explicit GraphExecutor(Graph &graph, std::string source_dir = ".",

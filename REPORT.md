@@ -11,7 +11,7 @@ Modern data pipelines frequently need retroaction: revising an earlier input rec
 
 **RetroC** is an optimizing research compiler and execution engine for a pure, versioned dataflow language that makes retroactive history edits first-class compiler operations. RetroC compiles declarative pipelines into a versioned Directed Acyclic Graph (the **Retroactive IR**) with fine-grained per-record memo tables, dynamic topological reordering, and hash-based early cutoff. We define formal rewrite semantics for three retroactive edit types: **modifying an input record**, **inserting a stage**, and **deleting a stage**. Furthermore, we introduce an incremental tree-based reduction (`tree_reduce`) that propagates updates in $O(\log N)$ evaluations for associative combiners.
 
-Experimental evaluation across four representative workloads (W1–W4) demonstrates up to **10.9× execution speedups** over full reruns and **>80% operator reuse**, with less than **1.15× first-run memoization overhead**. End-to-end correctness is proved empirically through an automated differential verifier running **1,000 randomized fuzzing trials with 100% equivalence**.
+Experimental evaluation across four representative workloads (W1–W4) shows that RetroC is faster than a full rerun in all **35 measured scenarios** (1.08×–53,400×); a single-record edit is **525×–53,400× faster** from 10k to 1M records. It beats stage-level invalidation in 33 of 34 scenarios and is on par in the remaining one (W4 E-F, 0.98×), where both strategies do identical work. Recording history costs 18.9% on the first run. End-to-end correctness is confirmed by **10,000 randomized differential trials with 100% equivalence** and by the verifier on every benchmark scenario.
 
 ---
 
@@ -145,19 +145,28 @@ Through `retroc explain <output>`, users inspect the provenance chain tracing wh
   - **B2 (RetroC Fine-Grained)**: Full fine-grained record memoization, work-set propagation, and early cutoff.
 
 ### 7.2 Measured Performance Results
-Evaluated on the four workloads defined in `docs/BENCHMARKS.md`:
+Evaluated on the workloads defined in `docs/BENCHMARKS.md` (headline rows; [bench/published/2026-10-29/full_run.txt](bench/published/2026-10-29/full_run.txt) has all 35):
 
-| Workload | Scenario & Size | B0 (Full Rerun) | B1 (Stage Invalidation) | B2 (RetroC Fine-Grained) | Speedup (B2 vs B0) | Measured Reuse % |
+| Workload | Edit | B0 full rerun | B1 stage-level | B2 RetroC | vs full rerun | vs stage-level |
 |---|---|---|---|---|---|---|
-| **W1 (Synthetic ETL)** | 100,000 records, modify 1 row | 37.1 ms | 37.4 ms | **3.4 ms** | **10.9×** | 50.0% |
-| **W2 (Branching Pipeline)** | 10,000 records, insert near end | 3.5 ms | 2.5 ms | **1.2 ms** | **2.9×** | **81.3%** |
-| **W3 (Two-Table Join)** | 10,000 records, modify left key | 18.2 ms | 18.0 ms | **12.5 ms** | **1.5×** | 33.3% |
-| **W4 (Deep Linear Pipeline)** | 10,000 records, 7 stages, modify head | 8.8 ms | 8.9 ms | **2.9 ms** | **3.0×** | 40.0% |
+| W1 sensor pipeline, 10k | modify 1 record | 30.3 ms | 29.9 ms | **0.06 ms** | **525×** | 520× |
+| W1 sensor pipeline, 100k | modify 1 record | 504.1 ms | 515.9 ms | **0.09 ms** | **5,444×** | 5,572× |
+| W1 sensor pipeline, 1M | modify 1 record | 5,259.9 ms | 5,493.9 ms | **0.10 ms** | **53,400×** | 55,776× |
+| W2 join (500 users + 2,000 orders) | modify 1 record | 8.47 ms | 9.15 ms | **0.05 ms** | **185×** | 199× |
+| W3 12-stage pipeline, 100k | modify 1 record | 1,592.6 ms | 1,507.0 ms | **0.15 ms** | **10,617×** | 10,047× |
+| W4 reduce-heavy, 1M | modify 1 record | 1,392.0 ms | 1,339.8 ms | **0.05 ms** | **27,348×** | 26,323× |
+| W1 sensor pipeline, 100k | modify 100 records | 508.2 ms | 40,723.1 ms | **9.84 ms** | **51.6×** | 4,138× |
+| W4 reduce-heavy, 1M | modify 100 records | 1,398.0 ms | 133,673.0 ms | **1.31 ms** | **1,065×** | 101,838× |
+| W1 sensor pipeline, 100k | insert map near end | 611.4 ms | 156.9 ms | **139.8 ms** | **4.37×** | 1.12× |
+| W3 12-stage pipeline, 100k | insert identity map | 1,908.6 ms | 312.4 ms | **243.2 ms** | **7.85×** | 1.28× |
+| W1 sensor pipeline, 100k | insert map near start | 624.9 ms | 521.0 ms | **503.4 ms** | **1.24×** | 1.04× |
+
+Protocol: pinned to one core, 3 warm-up runs and the median of 11 (runs over 10 s: 1 warm-up, median of 5), systems timed round-robin.
 
 ### 7.3 Key Observations
-1. **Fine-Grained Advantage (W1 & W4)**: On single-record edits in large collections (100k rows), B1 performs identical work to a full rerun (37.4 ms vs 37.1 ms) because it invalidates whole stages. RetroC (B2) recomputes only the affected row across map/filter stages, achieving a **10.9× speedup**.
-2. **Structural Reuse (W2)**: Inserting a stage late in a branching DAG allows all upstream stages (representing 81.3% of total pipeline operations) to be completely reused from cache.
-3. **Memoization Overhead**: The initial cold execution with memo tables and history recording takes ~37 ms on W1, compared to ~32 ms for a bare run, representing an overhead factor of only **1.15×** (well below the PRD target threshold of 2.5×).
+1. **Record-level advantage**: on a single-record edit B1 does the same work as a full rerun (5,493.9 ms vs 5,259.9 ms on W1-1M) because it invalidates whole stages. RetroC recomputes only the affected record and patches the sum in place (0.10 ms), a **53,400× speedup** that grows with input size.
+2. **Structural edits**: inserting a stage near the end reuses everything upstream (4.37× faster than a rerun on W1-100k); inserting an identity map lets every downstream record be reused (7.85× on W3). A per-stage cost model avoids bookkeeping that cannot pay off, so even an insert at the very start, which changes every record, stays ahead of a rerun.
+3. **Memoization overhead**: 18.9% (479.2 ms plain vs 569.7 ms with memo and history, W1-100k), repaid by the first edit. This is well below the PRD threshold of 2.5×.
 
 ---
 
@@ -169,7 +178,7 @@ $$\text{Propagate}(P, E) \equiv \text{Run}(\text{Rewrite}(P, E))$$
 
 ### 8.2 Verification Architecture
 1. **Automated Verifier (`retroc verify`)**: Evaluates the initial pipeline, applies edits through the propagator, parses the source-rewritten program, executes it in a pristine runtime, and compares outputs using structural equality (`Value::operator==`) and string equivalence.
-2. **Differential Fuzzing (`difftest`)**: An autonomous test harness generating randomized programs and edit sequences. Across **1,000 randomized trials**, zero mismatches occurred (100% pass rate).
+2. **Differential Fuzzing (`difftest`)**: An autonomous test harness generating randomized programs and edit sequences. Across **10,000 randomized trials** (5 seeds × 2,000), zero mismatches occurred (100% pass rate).
 3. **Atomic Error Rejection**: The differential fuzzer injects invalid edits (out-of-bounds record IDs, duplicate field names, invalid stage insertions). In every case, the system returns error code `E601`, triggers state rollback, and confirms that prior outputs remain unaltered.
 
 ---

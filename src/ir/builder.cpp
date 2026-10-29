@@ -227,6 +227,23 @@ LambdaIR IRBuilder::lower_lambda(const LambdaExpr* lam,
     return res;
 }
 
+// Stages that fn/init read by name become inputs after the iterated
+// collections (IR_SPEC section 4), so the edge orders them first (I1) and a
+// change to them reaches this node. The iterated collection may appear here
+// too: reading it by name (e.g. length(xs)) depends on every record.
+void IRBuilder::append_reference_inputs(Node& node) const {
+    std::vector<std::string> names;
+    if (node.fn) collect_stage_dependencies(node.fn->body.get(), names);
+    if (node.join_fn_b) collect_stage_dependencies(node.join_fn_b->body.get(), names);
+    collect_stage_dependencies(node.init.get(), names);
+    for (const auto& name : names) {
+        auto it = stage_to_node_.find(name);
+        if (it != stage_to_node_.end()) {
+            node.inputs.push_back(it->second);
+        }
+    }
+}
+
 std::string IRBuilder::lower_stage_expression(const std::string& target_stage_name,
                                               const Expr* expr,
                                               TypePtr explicit_type) {
@@ -296,6 +313,7 @@ std::string IRBuilder::lower_stage_expression(const std::string& target_stage_na
 
         auto it = prog_.expr_types.find(expr);
         node.type = (it != prog_.expr_types.end()) ? it->second : nullptr;
+        append_reference_inputs(node);
 
         graph_.nodes[nid] = std::move(node);
         graph_.order.push_back(nid);
@@ -329,6 +347,7 @@ std::string IRBuilder::lower_stage_expression(const std::string& target_stage_na
 
         auto it = prog_.expr_types.find(expr);
         node.type = (it != prog_.expr_types.end()) ? it->second : nullptr;
+        append_reference_inputs(node);
 
         graph_.nodes[nid] = std::move(node);
         graph_.order.push_back(nid);
@@ -364,6 +383,7 @@ std::string IRBuilder::lower_stage_expression(const std::string& target_stage_na
 
         auto it = prog_.expr_types.find(expr);
         node.type = (it != prog_.expr_types.end()) ? it->second : nullptr;
+        append_reference_inputs(node);
 
         graph_.nodes[nid] = std::move(node);
         graph_.order.push_back(nid);
@@ -399,6 +419,7 @@ std::string IRBuilder::lower_stage_expression(const std::string& target_stage_na
 
         auto it = prog_.expr_types.find(expr);
         node.type = (it != prog_.expr_types.end()) ? it->second : nullptr;
+        append_reference_inputs(node);
 
         graph_.nodes[nid] = std::move(node);
         graph_.order.push_back(nid);
@@ -445,6 +466,7 @@ std::string IRBuilder::lower_stage_expression(const std::string& target_stage_na
 
         auto it = prog_.expr_types.find(expr);
         node.type = (it != prog_.expr_types.end()) ? it->second : nullptr;
+        append_reference_inputs(node);
 
         graph_.nodes[nid] = std::move(node);
         graph_.order.push_back(nid);

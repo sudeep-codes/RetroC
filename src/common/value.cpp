@@ -107,6 +107,35 @@ uint64_t Value::hash() const {
     return h;
 }
 
+uint64_t Value::equality_hash() const {
+    switch (kind) {
+        case ValueKind::FLOAT:
+            if (float_val == 0.0) return Value::make_float(0.0).hash();
+            return hash();
+        case ValueKind::ARRAY: {
+            uint64_t h = hash_combine(14695981039346656037ULL, static_cast<uint64_t>(kind));
+            h = hash_combine(h, array_val.size());
+            for (const auto& elem : array_val) {
+                h = hash_combine(h, elem.equality_hash());
+            }
+            return h;
+        }
+        case ValueKind::RECORD: {
+            uint64_t h = hash_combine(14695981039346656037ULL, static_cast<uint64_t>(kind));
+            h = hash_combine(h, record_val.size());
+            for (const auto& f : record_val) {
+                h = hash_combine(h, hash_bytes(f.name.data(), f.name.size()));
+                if (f.value) {
+                    h = hash_combine(h, f.value->equality_hash());
+                }
+            }
+            return h;
+        }
+        default:
+            return hash();
+    }
+}
+
 std::string Value::to_string() const {
     switch (kind) {
         case ValueKind::INT:

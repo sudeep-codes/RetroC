@@ -91,7 +91,18 @@ const CollectionItem* find_record(const Collection& col, RecordId id) {
 
 // Kinds that can consume a set of changed RecordIds instead of a full rescan
 bool tracks_records(NodeKind kind) {
-    return kind == NodeKind::MAP || kind == NodeKind::FILTER || kind == NodeKind::TREE_REDUCE;
+    return kind == NodeKind::MAP || kind == NodeKind::FILTER || kind == NodeKind::TREE_REDUCE ||
+           kind == NodeKind::REDUCE;
+}
+
+// Cost model (Phase 12.2) in units of node.cost per record evaluation. A patch
+// also pays a few hash-table lookups per changed record; past the break-even
+// point one sequential pass is cheaper.
+constexpr double kPatchLookupCost = 2.0;
+
+bool patch_is_cheaper(const Node& node, size_t changed, size_t total) {
+    double c = node.cost > 0 ? node.cost : 1.0;
+    return static_cast<double>(changed) * (c + kPatchLookupCost) < static_cast<double>(total) * c;
 }
 
 } // namespace
@@ -220,6 +231,30 @@ std::variant<RebuildPlan, CompileError> Propagator::apply_modify(const ModifyEdi
     return plan;
 }
 
+namespace {
+
+// A literal of the given type, used only to declare names for type checking
+std::string default_literal(const Type& t) {
+    switch (t.kind) {
+        case TypeKind::INT:    return "0";
+        case TypeKind::FLOAT:  return "0.0";
+        case TypeKind::BOOL:   return "false";
+        case TypeKind::STRING: return "\"\"";
+        case TypeKind::ARRAY:  return "[]";
+        case TypeKind::RECORD: {
+            std::string out = "{ ";
+            for (size_t i = 0; i < t.fields.size(); ++i) {
+                if (i) out += ", ";
+                out += t.fields[i].name + ": " + default_literal(*t.fields[i].type);
+            }
+            return out + " }";
+        }
+    }
+    return "0";
+}
+
+} // namespace
+
 std::variant<RebuildPlan, CompileError> Propagator::apply_insert(const InsertEdit& edit) {
     // Edit B preconditions (EDIT_SEMANTICS.md section 4):
     // "<stage> exists and is not an INPUT; its first input P is a collection;
@@ -307,6 +342,17 @@ std::variant<RebuildPlan, CompileError> Propagator::apply_insert(const InsertEdi
     if (target_node->kind == NodeKind::MAP || target_node->kind == NodeKind::FILTER) {
         // If target_node is MAP or FILTER, verify its lambda works with new_elem_type
         std::string check_src = "input " + new_name + ": " + new_output_type->to_string() + " = [];\n";
+        // Stages the lambda reads by name must exist, with their types (I6)
+        for (size_t i = collection_arity(target_node->kind); i < target_node->inputs.size(); ++i) {
+            const Node* ref = graph_.get_node(target_node->inputs[i]);
+            if (!ref || !ref->type || ref->name == new_name) continue;
+            if (ref->type->kind == TypeKind::ARRAY) {
+                check_src += "input " + ref->name + ": " + ref->type->to_string() + " = [];\n";
+            } else {
+                check_src += "let " + ref->name + ": " + ref->type->to_string() + " = " +
+                             default_literal(*ref->type) + ";\n";
+            }
+        }
         if (target_node->kind == NodeKind::MAP) {
             check_src += "let " + target_node->name + " = map(" + new_name + ", " + format_lambda_ir(*target_node->fn) + ");\n";
         } else {
@@ -425,6 +471,16 @@ std::variant<RebuildPlan, CompileError> Propagator::apply_delete(const DeleteEdi
         }
     }
 
+    // A stage read by name in another expression cannot be removed: the name
+    // would no longer resolve after the rewrite (I6).
+    for (const auto& [id, n] : graph_.nodes) {
+        if (reads_by_name(n, target_node->id)) {
+            return CompileError{ErrorCode::E601, edit.loc,
+                                "delete failed: stage '" + edit.stage_name + "' is read by name in '" +
+                                n.name + "'"};
+        }
+    }
+
     // Precondition check: type compatibility (I6)
     // If MAP changed the element type, deleting it may break consumers unless p_node's element type matches
     if (!types_equal(target_node->type, p_node->type)) {
@@ -482,31 +538,172 @@ std::variant<RebuildPlan, CompileError> Propagator::apply_delete(const DeleteEdi
     results.erase(target_id);
     executor_.mutable_stage_values().erase(target_name);
 
-    // 4. Seed consumers with every record of P: each consumer reuses memo
-    // entries whose input hash is unchanged (early cutoff).
+    // 4. Every record of each consumer's input may differ: consumers rescan,
+    // reusing memo entries whose input hash is unchanged (early cutoff).
     WorkSet ws;
     ws.edit_kind = EditKind::DELETE;
-    std::vector<RecordId> seed;
-    const auto& p_res = results[p_id];
-    if (p_res.is_collection) {
-        seed.reserve(p_res.collection_val.size());
-        for (const auto& item : p_res.collection_val) {
-            seed.push_back(item.id);
-        }
-    }
     for (const auto& c_id : consumers) {
-        seed_consumer(c_id, ws, p_res.is_collection ? &seed : nullptr);
+        seed_consumer(c_id, ws, nullptr, p_id);
     }
 
     propagate(ws, plan, hist_entry);
     return plan;
 }
 
+namespace {
+
+// Type-checks a record literal against an input's element type by compiling
+// a one-record program, and returns its value.
+std::variant<Value, CompileError> parse_record_literal(const Node& input, const std::string& literal,
+                                                       const SourceLocation& loc) {
+    std::string src = "input " + input.name + ": " + input.type->to_string() + " = [" + literal + "];\n" +
+                      "output " + input.name + ";\n";
+    Lexer lexer(src);
+    auto toks = lexer.tokenize();
+    if (std::holds_alternative<CompileError>(toks)) {
+        return CompileError{ErrorCode::E601, loc, "insert failed: invalid literal: " +
+                            std::get<CompileError>(toks).message};
+    }
+    Parser parser(std::get<std::vector<Token>>(toks));
+    auto parsed = parser.parse();
+    if (std::holds_alternative<CompileError>(parsed)) {
+        return CompileError{ErrorCode::E601, loc, "insert failed: invalid literal: " +
+                            std::get<CompileError>(parsed).message};
+    }
+    SemanticAnalyzer sema(std::get<Program>(std::move(parsed)));
+    auto typed = sema.analyze();
+    if (std::holds_alternative<CompileError>(typed)) {
+        return CompileError{ErrorCode::E601, loc, "insert failed: literal does not match the type of '" +
+                            input.name + "': " + std::get<CompileError>(typed).message};
+    }
+    IRBuilder builder(std::get<TypedProgram>(typed));
+    Graph g = builder.build();
+    GraphExecutor ex(g, ".", /*enable_memo=*/false);
+    try {
+        ex.run();
+    } catch (const RuntimeError& err) {
+        return CompileError{ErrorCode::E601, loc, "insert failed: " + err.message};
+    }
+    const Node* n = g.find_node_by_name(input.name);
+    const auto& col = ex.get_result(n->id).collection_val;
+    if (col.size() != 1) {
+        return CompileError{ErrorCode::E601, loc, "insert failed: expected exactly one record"};
+    }
+    return col[0].value;
+}
+
+} // namespace
+
+std::variant<RebuildPlan, CompileError> Propagator::apply_edit(const Edit& edit) {
+    switch (edit.kind()) {
+        case EditKind::MODIFY:        return apply_modify(static_cast<const ModifyEdit&>(edit));
+        case EditKind::INSERT:        return apply_insert(static_cast<const InsertEdit&>(edit));
+        case EditKind::DELETE:        return apply_delete(static_cast<const DeleteEdit&>(edit));
+        case EditKind::INSERT_RECORD: return apply_insert_record(static_cast<const InsertRecordEdit&>(edit));
+        case EditKind::DELETE_RECORD: return apply_delete_record(static_cast<const DeleteRecordEdit&>(edit));
+    }
+    return CompileError{ErrorCode::E601, edit.loc, "unknown edit kind"};
+}
+
+std::variant<RebuildPlan, CompileError> Propagator::apply_insert_record(const InsertRecordEdit& edit) {
+    // Preconditions (EDIT_SEMANTICS.md section 5a): the stage is an INPUT and
+    // the literal has its element type.
+    Node* input_node = graph_.find_node_by_name(edit.input_stage);
+    if (!input_node || input_node->kind != NodeKind::INPUT) {
+        return CompileError{ErrorCode::E601, edit.loc,
+                            "insert failed: '" + edit.input_stage + "' is not an INPUT stage"};
+    }
+    auto& results = executor_.mutable_results();
+    auto it_res = results.find(input_node->id);
+    if (it_res == results.end() || !it_res->second.is_collection || !input_node->type) {
+        return CompileError{ErrorCode::E601, edit.loc,
+                            "insert failed: stage '" + edit.input_stage + "' has no collection data"};
+    }
+    auto parsed = parse_record_literal(*input_node, edit.raw_literal_text, edit.loc);
+    if (std::holds_alternative<CompileError>(parsed)) {
+        return std::get<CompileError>(parsed);
+    }
+
+    NodeExecutionResult& in_res = it_res->second;
+    auto next = next_record_id_.find(input_node->id);
+    if (next == next_record_id_.end()) {
+        RecordId first = in_res.collection_val.empty() ? 0 : in_res.collection_val.back().id + 1;
+        next = next_record_id_.emplace(input_node->id, first).first;
+    }
+    RecordId rid = next->second++;
+    // A fresh id is larger than every id in the collection, so appending keeps
+    // it sorted by RecordId (I7); a rerun appends the literal at the end too.
+    Value v = std::get<Value>(std::move(parsed));
+    in_res.term_sum += collection_item_term(rid, v.hash());
+    in_res.collection_val.push_back(CollectionItem{rid, std::move(v)});
+    return propagate_input_change(*input_node, rid, EditKind::INSERT_RECORD, edit.to_string());
+}
+
+std::variant<RebuildPlan, CompileError> Propagator::apply_delete_record(const DeleteRecordEdit& edit) {
+    Node* input_node = graph_.find_node_by_name(edit.input_stage);
+    if (!input_node || input_node->kind != NodeKind::INPUT) {
+        return CompileError{ErrorCode::E601, edit.loc,
+                            "delete failed: '" + edit.input_stage + "' is not an INPUT stage"};
+    }
+    auto& results = executor_.mutable_results();
+    auto it_res = results.find(input_node->id);
+    if (it_res == results.end() || !it_res->second.is_collection) {
+        return CompileError{ErrorCode::E601, edit.loc,
+                            "delete failed: stage '" + edit.input_stage + "' has no collection data"};
+    }
+    NodeExecutionResult& in_res = it_res->second;
+    auto pos = lower_bound_id(in_res.collection_val, edit.record_id);
+    if (pos == in_res.collection_val.end() || pos->id != edit.record_id) {
+        return CompileError{ErrorCode::E601, edit.loc,
+                            "delete failed: RecordId " + std::to_string(edit.record_id) + " not found in '" +
+                            edit.input_stage + "'"};
+    }
+    if (next_record_id_.find(input_node->id) == next_record_id_.end()) {
+        next_record_id_[input_node->id] = in_res.collection_val.back().id + 1;
+    }
+    in_res.term_sum -= collection_item_term(pos->id, pos->value.hash());
+    in_res.collection_val.erase(pos);
+    return propagate_input_change(*input_node, edit.record_id, EditKind::DELETE_RECORD, edit.to_string());
+}
+
+RebuildPlan Propagator::propagate_input_change(Node& input_node, RecordId changed, EditKind kind,
+                                               const std::string& description) {
+    auto& results = executor_.mutable_results();
+    NodeExecutionResult& in_res = results[input_node.id];
+
+    RebuildPlan plan;
+    plan.edit_id = executor_.get_history().next_edit_id++;
+    plan.edit_description = description;
+    HistoryEntry hist_entry;
+    hist_entry.edit_id = plan.edit_id;
+    hist_entry.description = description;
+    hist_entry.nodes_touched.push_back(input_node.name);
+
+    // Invariant I4: the record set changed, so the hash and version change
+    input_node.version++;
+    input_node.outHash = in_res.hash();
+    stage_refs_ = analyze_stage_refs(graph_);
+    store_stage_value(executor_.mutable_stage_values(), stage_refs_, input_node.name, in_res);
+
+    WorkSet ws;
+    ws.edit_kind = kind;
+    std::vector<RecordId> seed{changed};
+    mark_consumers(input_node, build_consumer_index(graph_), ws, &seed);
+    propagate(ws, plan, hist_entry);
+    return plan;
+}
+
 void Propagator::seed_consumer(const NodeId& consumer, WorkSet& ws,
-                               const std::vector<RecordId>* records) {
+                               const std::vector<RecordId>* records, const NodeId& producer) {
     ws.dirty.insert(consumer);
     const Node* cn = graph_.get_node(consumer);
-    if (records && !stage_invalidation_ && cn && tracks_records(cn->kind)) {
+    if (records && !stage_invalidation_ && cn && cn->kind == NodeKind::JOIN) {
+        for (size_t side = 0; side < 2; ++side) {
+            if (cn->inputs[side] == producer) {
+                ws.join_pending[consumer][side].insert(records->begin(), records->end());
+            }
+        }
+    } else if (records && !stage_invalidation_ && cn && tracks_records(cn->kind)) {
         ws.pending[consumer].insert(records->begin(), records->end());
     } else {
         ws.full_scan.insert(consumer);
@@ -518,7 +715,10 @@ void Propagator::mark_consumers(const Node& node, const ConsumerIndex& consumers
     auto it = consumers.find(node.id);
     if (it == consumers.end()) return;
     for (const auto& c : it->second) {
-        seed_consumer(c, ws, changed_out);
+        // A stage read by name (not iterated) can affect every record of c
+        const Node* cn = graph_.get_node(c);
+        bool by_name = cn && reads_by_name(*cn, node.id);
+        seed_consumer(c, ws, by_name ? nullptr : changed_out, node.id);
     }
 }
 
@@ -562,6 +762,7 @@ void Propagator::propagate(WorkSet& ws, RebuildPlan& plan, HistoryEntry& hist) {
 
         hist.nodes_touched.push_back(node->name);
         uint64_t prev_out_hash = node->outHash;
+        node->memoKey = compute_memo_key(*node, results);
 
         if (node->kind == NodeKind::OUTPUT) {
             NodeExecutionResult& res = results[node_id];
@@ -585,17 +786,17 @@ void Propagator::propagate(WorkSet& ws, RebuildPlan& plan, HistoryEntry& hist) {
         switch (node->kind) {
             case NodeKind::MAP:
             case NodeKind::FILTER:
-                process_map_filter(*node, ws, sp, changed_out);
-                tracked = !stage_invalidation_;
+                tracked = process_map_filter(*node, ws, sp, changed_out);
                 break;
             case NodeKind::REDUCE:
-                process_reduce(*node, sp);
+                process_reduce(*node, ws, sp);
                 break;
             case NodeKind::TREE_REDUCE:
                 process_tree_reduce(*node, ws, sp);
                 break;
             case NodeKind::JOIN:
-                process_join(*node, sp);
+                process_join(*node, ws, sp, changed_out);
+                tracked = !stage_invalidation_;
                 break;
             case NodeKind::SCALAR:
                 process_scalar(*node, sp);
@@ -641,7 +842,7 @@ void Propagator::propagate(WorkSet& ws, RebuildPlan& plan, HistoryEntry& hist) {
     finish_plan(plan, hist);
 }
 
-void Propagator::process_map_filter(Node& node, WorkSet& ws, StagePlan& sp,
+bool Propagator::process_map_filter(Node& node, WorkSet& ws, StagePlan& sp,
                                     std::vector<RecordId>& changed_out) {
     auto& results = executor_.mutable_results();
     auto& stage_values = executor_.mutable_stage_values();
@@ -649,9 +850,17 @@ void Propagator::process_map_filter(Node& node, WorkSet& ws, StagePlan& sp,
     const Collection& in = results[node.inputs[0]].collection_val;
 
     const bool is_map = (node.kind == NodeKind::MAP);
+    bool tracked = !stage_invalidation_;
     const bool is_new = (node.id == ws.new_stage);
-    const bool lookup_memo = use_record_memo() && !is_new;
-    const bool store_memo = use_record_memo();
+    // Cost model (Phase 12.2): a memo lookup or store costs about as much as a
+    // cheap lambda, so the memo only pays off when lookups hit. A new stage
+    // has nothing to look up and its memo is filled lazily by later edits;
+    // a full pass whose sample of lookups almost all miss switches both off.
+    // Entries left untouched stay correct: they are keyed by input hash (I3).
+    bool lookup_memo = use_record_memo() && !is_new;
+    bool store_memo = use_record_memo() && !is_new;
+    size_t looked_up = 0;
+    size_t missed = 0;
 
     res.is_collection = true;
     sp.ops_total = in.size();
@@ -662,13 +871,16 @@ void Propagator::process_map_filter(Node& node, WorkSet& ws, StagePlan& sp,
     // Evaluates one record. Returns true if fn ran (memo miss); sets present
     // (record is in the output) and out (its output value).
     auto eval = [&](const CollectionItem& item, bool& present, Value& out) -> bool {
-        uint64_t in_hash = item.value.hash();
+        uint64_t in_hash = (lookup_memo || store_memo) ? item.value.hash() : 0;
         if (lookup_memo) {
+            looked_up++;
+            missed++; // undone on a hit below
             // Invariant I3: reuse only if inHash AND fnHash match
             if (is_map) {
                 auto it = node.memo.map_memo.find(item.id);
                 if (it != node.memo.map_memo.end() && it->second.inHash == in_hash &&
-                    it->second.fnHash == node.fnHash) {
+                    it->second.fnHash == node.memoKey) {
+                    missed--;
                     present = true;
                     out = it->second.out;
                     return false;
@@ -676,7 +888,8 @@ void Propagator::process_map_filter(Node& node, WorkSet& ws, StagePlan& sp,
             } else {
                 auto it = node.memo.filter_memo.find(item.id);
                 if (it != node.memo.filter_memo.end() && it->second.inHash == in_hash &&
-                    it->second.fnHash == node.fnHash) {
+                    it->second.fnHash == node.memoKey) {
+                    missed--;
                     present = it->second.keep;
                     if (present) out = item.value;
                     return false;
@@ -686,12 +899,12 @@ void Propagator::process_map_filter(Node& node, WorkSet& ws, StagePlan& sp,
         sp.ops_evaluated++;
         Value v = VM::execute(prog, {item.value}, stage_values);
         if (is_map) {
-            if (store_memo) node.memo.map_memo[item.id] = MapMemoEntry{in_hash, node.fnHash, v};
+            if (store_memo) node.memo.map_memo[item.id] = MapMemoEntry{in_hash, node.memoKey, v};
             present = true;
             out = std::move(v);
         } else {
             present = v.bool_val;
-            if (store_memo) node.memo.filter_memo[item.id] = FilterMemoEntry{in_hash, node.fnHash, present};
+            if (store_memo) node.memo.filter_memo[item.id] = FilterMemoEntry{in_hash, node.memoKey, present};
             if (present) out = item.value;
         }
         return true;
@@ -709,10 +922,22 @@ void Propagator::process_map_filter(Node& node, WorkSet& ws, StagePlan& sp,
         Collection out_col;
         out_col.reserve(is_map ? in.size() : old.size());
         uint64_t sum = 0;
-        // B1 consumers rescan everything, so they need no changed-record set
-        const bool track = !stage_invalidation_;
+        // B1 consumers rescan everything, and so do consumers of a new stage
+        // (see below), so neither needs a changed-record set
+        bool track = !stage_invalidation_ && !is_new;
         size_t oi = 0;
+        constexpr size_t kSample = 64;
         for (const auto& item : in) {
+            if (lookup_memo && looked_up == kSample && missed * 8 >= looked_up * 7) {
+                // >= 7/8 misses: the rest would miss too, and nearly every
+                // output changes, so consumers rescan instead of patching
+                lookup_memo = false;
+                store_memo = false;
+                if (!is_new) {
+                    track = false;
+                    changed_out.clear();
+                }
+            }
             bool present = false;
             Value v;
             bool reevaluated = eval(item, present, v);
@@ -744,6 +969,7 @@ void Propagator::process_map_filter(Node& node, WorkSet& ws, StagePlan& sp,
         }
         res.collection_val = std::move(out_col);
         res.term_sum = sum;
+        tracked = track;
     } else if (n_pending > 0) {
         std::vector<RecordId> ids(pend_it->second.begin(), pend_it->second.end());
         std::sort(ids.begin(), ids.end());
@@ -779,18 +1005,18 @@ void Propagator::process_map_filter(Node& node, WorkSet& ws, StagePlan& sp,
 
     if (is_new) {
         // Consumers used to read P directly, so every record of P may differ
-        // from what they saw before.
+        // from what they saw before: they rescan (memo lookups still reuse
+        // records the new stage left unchanged), which is cheaper than
+        // listing every RecordId.
+        tracked = false;
         changed_out.clear();
-        for (const auto& item : in) {
-            changed_out.push_back(item.id);
-        }
     }
 
     // Records not evaluated were served from the memo (or were untouched).
     sp.ops_reused = sp.ops_total - sp.ops_evaluated;
     if (is_new) {
         sp.status = StagePlanStatus::NEW;
-    } else if (sp.ops_evaluated == 0) {
+    } else if (sp.ops_evaluated == 0 && changed_out.empty()) {
         sp.status = StagePlanStatus::REUSED;
     } else if (sp.ops_evaluated == sp.ops_total) {
         sp.status = StagePlanStatus::FULL;
@@ -800,26 +1026,77 @@ void Propagator::process_map_filter(Node& node, WorkSet& ws, StagePlan& sp,
             sp.note = "(early cutoff on unchanged inputs)";
         }
     }
+    return tracked;
 }
 
-void Propagator::process_reduce(Node& node, StagePlan& sp) {
+void Propagator::process_reduce(Node& node, WorkSet& ws, StagePlan& sp) {
     auto& results = executor_.mutable_results();
     auto& stage_values = executor_.mutable_stage_values();
     NodeExecutionResult& res = results[node.id];
     const NodeExecutionResult& in_res = results[node.inputs[0]];
+    const Collection& in = in_res.collection_val;
     res.is_collection = false;
-    sp.ops_total = in_res.collection_val.size();
+    sp.ops_total = in.size();
 
     uint64_t in_hash = in_res.hash();
     uint64_t init_hash = node.init ? hash_expr_ir(node.init.get()) : 0;
+    const ExprIR* term = use_record_memo() ? additive_reduce_term(node) : nullptr;
 
     if (executor_.enable_memo() && node.memo.reduce_memo.valid &&
         node.memo.reduce_memo.inputHash == in_hash &&
-        node.memo.reduce_memo.fnHash == node.fnHash &&
+        node.memo.reduce_memo.fnHash == node.memoKey &&
         node.memo.reduce_memo.initHash == init_hash) {
         sp.ops_reused = sp.ops_total;
         sp.status = StagePlanStatus::REUSED;
         res.scalar_val = node.memo.reduce_memo.result;
+        return;
+    }
+
+    if (term) {
+        auto& memo = node.memo.sum_memo;
+        auto pend_it = ws.pending.find(node.id);
+        size_t n_changed = (pend_it == ws.pending.end()) ? 0 : pend_it->second.size();
+        bool can_patch = memo.valid && memo.fnHash == node.memoKey && memo.initHash == init_hash &&
+                         ws.full_scan.count(node.id) == 0 && n_changed > 0 &&
+                         patch_is_cheaper(node, n_changed, in.size());
+        if (can_patch) {
+            // Swap the terms of the changed records: the sum of the others is
+            // unchanged, and int addition wraps, so the result equals the fold.
+            BytecodeCompiler term_comp(node.fn->params);
+            auto term_prog = term_comp.compile(term);
+            Value args[2] = {Value::make_int(0), Value()};
+            auto term_less = [](const std::pair<RecordId, int64_t>& e, RecordId id) { return e.first < id; };
+            for (RecordId rid : pend_it->second) {
+                auto pos = std::lower_bound(memo.terms.begin(), memo.terms.end(), rid, term_less);
+                bool had = (pos != memo.terms.end() && pos->first == rid);
+                if (had) memo.sum -= static_cast<uint64_t>(pos->second);
+                if (const CollectionItem* item = find_record(in, rid)) {
+                    args[1] = item->value;
+                    int64_t t = VM::execute(term_prog, args, 2, stage_values).int_val;
+                    sp.ops_evaluated++;
+                    memo.sum += static_cast<uint64_t>(t);
+                    if (had) {
+                        pos->second = t;
+                    } else {
+                        memo.terms.insert(pos, {rid, t});
+                    }
+                } else if (had) {
+                    memo.terms.erase(pos);
+                }
+            }
+            res.scalar_val = Value::make_int(static_cast<int64_t>(static_cast<uint64_t>(memo.init) + memo.sum));
+            sp.ops_reused = sp.ops_total > sp.ops_evaluated ? sp.ops_total - sp.ops_evaluated : 0;
+            // Even a pure removal changed the result, so the stage is never REUSED here
+            sp.status = StagePlanStatus::PARTIAL;
+            sp.note = "(sum patched per changed record)";
+        } else {
+            sp.ops_evaluated = execute_additive_reduce(node, term, in, res, stage_values, true);
+            sp.status = StagePlanStatus::FULL;
+            sp.note = "(cost model: full fold cheaper)";
+        }
+        if (executor_.enable_memo()) {
+            node.memo.reduce_memo = ReduceMemoEntry{in_hash, node.memoKey, init_hash, res.scalar_val, true};
+        }
         return;
     }
 
@@ -839,7 +1116,7 @@ void Propagator::process_reduce(Node& node, StagePlan& sp) {
     }
     res.scalar_val = acc;
     if (executor_.enable_memo()) {
-        node.memo.reduce_memo = ReduceMemoEntry{in_hash, node.fnHash, init_hash, acc, true};
+        node.memo.reduce_memo = ReduceMemoEntry{in_hash, node.memoKey, init_hash, acc, true};
     }
 }
 
@@ -862,7 +1139,7 @@ void Propagator::process_tree_reduce(Node& node, WorkSet& ws, StagePlan& sp) {
 
     bool can_incremental = (use_record_memo() && memo.valid &&
                             ws.full_scan.count(node.id) == 0 &&
-                            memo.fnHash == node.fnHash && memo.initHash == init_hash &&
+                            memo.fnHash == node.memoKey && memo.initHash == init_hash &&
                             memo.num_leaves == col.size() && !changed_recs.empty() &&
                             col.size() > 1);
     // Every changed record must still map to the same leaf; otherwise the leaf
@@ -979,81 +1256,125 @@ void Propagator::process_tree_reduce(Node& node, WorkSet& ws, StagePlan& sp) {
     res.scalar_val = memo.tree[1];
     memo.result = memo.tree[1];
     memo.inputHash = in_hash;
-    memo.fnHash = node.fnHash;
+    memo.fnHash = node.memoKey;
     memo.initHash = init_hash;
     memo.valid = true;
 }
 
-void Propagator::process_join(Node& node, StagePlan& sp) {
+// An edit that keeps every join key and adds or removes no input record
+// leaves the output layout (which pairs, at which positions) unchanged, so
+// only the output records built from the changed inputs are rebuilt.
+bool Propagator::patch_join(Node& node, WorkSet& ws, StagePlan& sp, std::vector<RecordId>& changed_out) {
+    auto& memo = node.memo;
+    auto jp = ws.join_pending.find(node.id);
+    if (!use_record_memo() || !memo.join_layout_valid || ws.full_scan.count(node.id) > 0 ||
+        jp == ws.join_pending.end()) {
+        return false;
+    }
     auto& results = executor_.mutable_results();
     auto& stage_values = executor_.mutable_stage_values();
     NodeExecutionResult& res = results[node.id];
-    const auto& left_res = results[node.inputs[0]];
-    const auto& right_res = results[node.inputs[1]];
-    res.is_collection = true;
-    sp.ops_total = left_res.collection_val.size() + right_res.collection_val.size();
-    sp.status = StagePlanStatus::FULL;
+    const Collection& left = results[node.inputs[0]].collection_val;
+    const Collection& right = results[node.inputs[1]].collection_val;
 
-    uint64_t ka_hash = node.fn ? hash_lambda_ir(*node.fn) : 0;
-    uint64_t kb_hash = node.join_fn_b ? hash_lambda_ir(*node.join_fn_b) : 0;
+    uint64_t refs = node.memoKey ^ node.fnHash;
+    uint64_t key_hash[2] = {hash_lambda_ir(*node.fn) ^ refs, hash_lambda_ir(*node.join_fn_b) ^ refs};
+    const LambdaIR* key_fn[2] = {&*node.fn, &*node.join_fn_b};
+    const Collection* side_col[2] = {&left, &right};
+    std::unordered_map<RecordId, JoinKeyEntry>* side_keys[2] = {&memo.join_left_keys, &memo.join_right_keys};
 
-    BytecodeCompiler ka_comp(node.fn->params);
-    auto ka_prog = ka_comp.compile(node.fn->body.get());
-    BytecodeCompiler kb_comp(node.join_fn_b->params);
-    auto kb_prog = kb_comp.compile(node.join_fn_b->body.get());
-
-    std::vector<std::pair<Value, const CollectionItem*>> right_keys;
-    right_keys.reserve(right_res.collection_val.size());
-    for (const auto& r_item : right_res.collection_val) {
-        Value key = VM::execute(kb_prog, {r_item.value}, stage_values);
-        sp.ops_evaluated++;
-        right_keys.push_back({std::move(key), &r_item});
-    }
-
-    Collection new_col;
-    RecordId out_id = 0;
-    for (const auto& l_item : left_res.collection_val) {
-        Value l_key = VM::execute(ka_prog, {l_item.value}, stage_values);
-        sp.ops_evaluated++;
-        uint64_t l_hash = l_item.value.hash();
-
-        for (const auto& [r_key, r_item_ptr] : right_keys) {
-            JoinPairKey pair_key{l_item.id, r_item_ptr->id};
-            uint64_t r_hash = r_item_ptr->value.hash();
-
-            if (use_record_memo()) {
-                auto memo_it = node.memo.join_memo.find(pair_key);
-                if (memo_it != node.memo.join_memo.end() &&
-                    memo_it->second.leftHash == l_hash &&
-                    memo_it->second.rightHash == r_hash &&
-                    memo_it->second.kaHash == ka_hash &&
-                    memo_it->second.kbHash == kb_hash) {
-                    if (memo_it->second.matched) {
-                        new_col.push_back(CollectionItem{out_id++, memo_it->second.out});
-                    }
-                    continue;
-                }
+    // Phase 1: every changed record must still exist and keep its key
+    struct Change { size_t side; RecordId id; uint64_t in_hash; };
+    std::vector<Change> changes;
+    size_t evals = 0;
+    for (size_t side = 0; side < 2; ++side) {
+        if (jp->second[side].empty()) continue;
+        BytecodeCompiler comp(key_fn[side]->params);
+        auto prog = comp.compile(key_fn[side]->body.get());
+        for (RecordId rid : jp->second[side]) {
+            const CollectionItem* item = find_record(*side_col[side], rid);
+            auto entry = side_keys[side]->find(rid);
+            // the record must have been in the input the layout was built from
+            if (!item || entry == side_keys[side]->end() || entry->second.keyFnHash != key_hash[side] ||
+                entry->second.layoutGen != memo.join_layout_gen) {
+                return false;
             }
-
-            bool matched = (l_key == r_key);
-            Value out_record;
-            if (matched) {
-                std::vector<RecordField> fields = {
-                    {"left", std::make_shared<Value>(l_item.value)},
-                    {"right", std::make_shared<Value>(r_item_ptr->value)}
-                };
-                out_record = Value::make_record(std::move(fields));
-                new_col.push_back(CollectionItem{out_id++, out_record});
+            uint64_t h = item->value.hash();
+            if (entry->second.inHash != h) {
+                evals++;
+                Value key = VM::execute(prog, &item->value, 1, stage_values);
+                if (!(key == entry->second.key)) return false;
             }
-            if (use_record_memo()) {
-                node.memo.join_memo[pair_key] = JoinMemoEntry{
-                    l_hash, r_hash, ka_hash, kb_hash, matched, std::move(out_record)
-                };
-            }
+            changes.push_back({side, rid, h});
         }
     }
-    res.collection_val = std::move(new_col);
-    res.rehash_collection();
+
+    // Phase 2: rebuild the output records that use a changed input
+    std::vector<size_t> touched;
+    for (const auto& c : changes) {
+        (*side_keys[c.side])[c.id].inHash = c.in_hash;
+        const auto& pos_index = c.side == 0 ? memo.join_left_pos : memo.join_right_pos;
+        auto it = pos_index.find(c.id);
+        if (it != pos_index.end()) touched.insert(touched.end(), it->second.begin(), it->second.end());
+    }
+    std::sort(touched.begin(), touched.end());
+    touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+    Collection& out = res.collection_val;
+    for (size_t pos : touched) {
+        const auto& [lid, rid] = memo.join_pairs[pos];
+        const CollectionItem* l = find_record(left, lid);
+        const CollectionItem* r = find_record(right, rid);
+        std::vector<RecordField> fields = {
+            {"left", std::make_shared<Value>(l->value)},
+            {"right", std::make_shared<Value>(r->value)}
+        };
+        Value record = Value::make_record(std::move(fields));
+        memo.join_memo[JoinPairKey{lid, rid}] =
+            JoinMemoEntry{l->value.hash(), r->value.hash(), key_hash[0], key_hash[1], true, record};
+        if (record == out[pos].value) continue;
+        res.term_sum -= collection_item_term(out[pos].id, out[pos].value.hash());
+        res.term_sum += collection_item_term(out[pos].id, record.hash());
+        out[pos].value = std::move(record);
+        changed_out.push_back(out[pos].id);
+    }
+    sp.ops_total = left.size() + right.size();
+    sp.ops_evaluated = evals;
+    sp.ops_reused = sp.ops_total - evals;
+    sp.status = (evals == 0 && changed_out.empty()) ? StagePlanStatus::REUSED : StagePlanStatus::PARTIAL;
+    sp.note = "(join patched in place)";
+    return true;
+}
+
+void Propagator::process_join(Node& node, WorkSet& ws, StagePlan& sp, std::vector<RecordId>& changed_out) {
+    if (patch_join(node, ws, sp, changed_out)) return;
+    auto& results = executor_.mutable_results();
+    NodeExecutionResult& res = results[node.id];
+    Collection old = std::move(res.collection_val);
+    const Collection& left = results[node.inputs[0]].collection_val;
+    const Collection& right = results[node.inputs[1]].collection_val;
+    sp.ops_total = left.size() + right.size();
+    // Keys of unchanged records come from the key index; the hash join itself
+    // is O(|left| + |right| + |output|) and evaluates no lambdas.
+    sp.ops_evaluated = execute_join(node, left, right, res, executor_.mutable_stage_values(),
+                                    use_record_memo());
+    sp.ops_reused = sp.ops_total - sp.ops_evaluated;
+    // Output RecordIds are positions 0, 1, 2, ...: report the positions whose
+    // record differs, so consumers patch only those (EDIT_SEMANTICS section 6).
+    // A pair added or removed early shifts every later id; those all differ.
+    const Collection& now = res.collection_val;
+    size_t common = std::min(old.size(), now.size());
+    for (size_t i = 0; i < common; ++i) {
+        if (old[i].value != now[i].value) changed_out.push_back(now[i].id);
+    }
+    for (size_t i = common; i < now.size(); ++i) changed_out.push_back(now[i].id);
+    for (size_t i = common; i < old.size(); ++i) changed_out.push_back(old[i].id);
+    if (sp.ops_evaluated == sp.ops_total) {
+        sp.status = StagePlanStatus::FULL;
+    } else if (sp.ops_evaluated == 0) {
+        sp.status = StagePlanStatus::REUSED;
+    } else {
+        sp.status = StagePlanStatus::PARTIAL;
+    }
 }
 
 void Propagator::process_scalar(Node& node, StagePlan& sp) {
@@ -1071,7 +1392,7 @@ void Propagator::process_scalar(Node& node, StagePlan& sp) {
 
     if (executor_.enable_memo() && node.memo.scalar_memo.valid &&
         node.memo.scalar_memo.inputsHash == inputs_hash &&
-        node.memo.scalar_memo.fnHash == node.fnHash) {
+        node.memo.scalar_memo.fnHash == node.memoKey) {
         sp.ops_reused = 1;
         sp.status = StagePlanStatus::REUSED;
         res.scalar_val = node.memo.scalar_memo.result;
@@ -1084,7 +1405,7 @@ void Propagator::process_scalar(Node& node, StagePlan& sp) {
     auto prog = comp.compile(node.expr.get());
     res.scalar_val = VM::execute(prog, {}, stage_values);
     if (executor_.enable_memo()) {
-        node.memo.scalar_memo = ScalarMemoEntry{inputs_hash, node.fnHash, res.scalar_val, true};
+        node.memo.scalar_memo = ScalarMemoEntry{inputs_hash, node.memoKey, res.scalar_val, true};
     }
 }
 

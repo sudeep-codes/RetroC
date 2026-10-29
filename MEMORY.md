@@ -1,14 +1,12 @@
 # MEMORY.md — Running state of the project (update at the end of every session)
 
 ## Current status
-- Current phase: Post-review improvements 1-2 of 5 done (O(n) rescan removed; full benchmark protocol run, results in bench/published/2026-10-28/, 6593 s, 35 scenarios, all verify PASS). Next: cost model (Phase 12.2).
-- Full-protocol headline (pinned P-core, median of 11): E-A modify 1 record B0/B2 = 9.63x (W1-10k), 9.87x (100k), 10.05x (1M), 22.39x (W3), 3.37x (W4-1M). B1/B2 on modifies 9-20x. Losses: E-B batches 0.03-0.23x, W2 joins 0.02-0.40x, insert near start 0.71-1.06x. Structural edits: B2 is 0.64-0.98x of B1 (C2 not supported). First-run overhead +42.7% (W1-100k).
-- Last session: 2026-10-28 — Rewrote propagation so work follows changed records; implemented the B1 baseline (it was never implemented); extended difftest. Toolchain now MSYS2 UCRT64 GCC 16.2.0, CMake 4.4.3, Ninja (installed this session; `export PATH=/c/msys64/ucrt64/bin:$PATH`).
-- Tests (2026-10-28): 8/8 CTest suites pass; 52 doctest cases, 687 assertions; difftest 10,000 trials (seeds 1, 1001, 5001, 20001, 77777 x 2000) pass. Sanitizers NOT run: MinGW GCC has no libasan/libubsan.
-- Previous status: Final Phase complete (Project complete: Report, Demo, and Documentation delivered)
-- Last session: 2026-10-27 — Final phase deliverables complete: authored comprehensive project report (REPORT.md per PRD section 9), created README.md with build and quickstart instructions, created end-to-end sensor-log demo (demo/pipeline.rc, demo/edits.rcs, demo/run_demo.bat, demo/run_demo.sh) running in < 2 seconds, 100% tests passing across all 8 suites.
-- Build: clean (GCC 15.2.0 / MinGW UCRT64, CMake 4.4.4)
-- Tests: 8 passed / 0 failed (100% pass across doctest unit tests (46 cases, 549 assertions), python golden tests, and differential testing runner with 1000 trials)
+- Current phase: Phase 12.2 (cost model) and 12.3 (record insert/delete) done; BUG-001 fixed. 12.4-12.6 are future work (user decision: student IEEE conference, skip extras). Final paper built.
+- Final benchmark (2026-10-29, bench/published/2026-10-29/, 5448 s, pinned --cpu 2, 3 warm-up + median of 11): all 35 scenarios B0/B2 >= 1.08x (max 53,400x W1-1M E-A); E-A 525x/5,444x/53,400x (W1 10k/100k/1M), 10,617x W3, 27,348x W4, 185x W2; E-B 6.23-1,065x. B1/B2 >= 1.02x in 33 of 34; W4 E-F is 0.98x (parity: identical work; separate re-run 505.0 vs 506.2 ms). First-run overhead 18.9% (W1-100k); memo 39.29 MB for 1.73 MB input. All 35 verify PASS.
+- Tests (2026-10-29): 8/8 CTest suites; doctest 65 cases, 1,097 assertions; difftest 10,000 trials (seeds 1, 1001, 5001, 20001, 77777 x 2000) pass. Sanitizers NOT run (MinGW has no libasan/libubsan).
+- Toolchain: MSYS2 UCRT64 GCC 16.2.0, CMake, Ninja (`export PATH=/c/msys64/ucrt64/bin:$PATH`).
+- Paper: paper/RetroC_IEEE_paper_final.docx/.pdf (12 pages, 9 figures, 20 refs, 4 authors) built by paper/build_paper.py from the published JSON; README.md and REPORT.md updated to the same numbers.
+- Uncommitted: all of the above. Last pushed commit 5720aa0.
 
 ## Decisions (append only; include the reason)
 | ID | Date | Decision | Reason |
@@ -36,6 +34,17 @@
 | D-021 | 2026-10-28 | Scenarios E-A..E-F for W1 (10k, 100k, 1M), W2, W3, W4 (1M, per spec); E-B = 1% of records capped at 100 edits; W1-1M E-B skips B1; W4 has no E-E | Edits apply one at a time and B1 recomputes the pipeline per edit; uncapped 1% at 1M under B1 would take days; deleting `mapped` in W4 changes the type |
 | D-022 | 2026-10-28 | W2 stays 500 users / 2,000 orders (spec: 50k/200k) | JOIN is a nested loop, so 50k x 200k = 10^10 comparisons is not runnable |
 | D-023 | 2026-10-28 | B0 for a modify on a CSV input runs on a patched copy of the cached CSV collection | Previously B0 reran the unedited data for CSV modifies |
+| D-024 | 2026-10-29 | Phase 12.2 cost model: an int REDUCE `(a, x) => a + t(x)` (t reads neither a nor a stage) keeps per-record terms (RecordId-sorted vector) and patches k changed records when k*(cost+2) < n*cost, else full fold | Int addition wraps, so it is associative and invertible; float is not and is never patched. Removed the O(n) reduce per edit (W1 single edit ~10x -> ~500x) |
+| D-025 | 2026-10-29 | JOIN is a hash join (executor and propagator) with a key index per side, a matched-pair memo, and the output layout (pair per position + positions per input record); an edit that keeps every key and adds/removes no record patches only affected output records | Nested loop + all-pairs memo made joins slower than a rerun; per-side pending sets in WorkSet.join_pending |
+| D-026 | 2026-10-29 | JOIN reports changed output positions (ids = positions), so its consumers patch | Consumers of a join rescanned every record on every edit |
+| D-027 | 2026-10-29 | MAP/FILTER full pass: after a 64-record sample with >= 7/8 memo misses, stop memo lookups, stores and per-record change tracking (consumers rescan); new stages store no memo (filled lazily) | When every record changes, memo bookkeeping only adds cost; untouched entries stay correct because they are keyed by input hash (I3) |
+| D-028 | 2026-10-29 | BUG-001 fix (spec change approved by user): stages read by name are inputs after the iterated collections; memo key = fnHash mixed with their outHash; a producer read by name makes its consumer full-scan; deleting a stage read by name is E601 | IR_SPEC section 2 and I3, EDIT_SEMANTICS sections 5 and 6 updated |
+| D-029 | 2026-10-29 | Phase 12.3 record edits: `retro insert into <input> : <literal>` (fresh RecordId, appended) and `retro delete <input>[<RecordId>]`; ids never reused; verifier maps RecordId to source position | EDIT_SEMANTICS section 5a added (user approved) |
+| D-030 | 2026-10-29 | Graph::find_node_by_name prefers a stage over the OUTPUT node of the same name | Answer depended on unordered_map order (BUG-004) |
+| D-031 | 2026-10-29 | 12.4-12.6 (control flow, C++ emission, Differential Dataflow/Adapton baseline) left as future work | User targets a student/university IEEE conference |
+| D-032 | 2026-10-29 | A new stage does not track changed records at all (its consumers rescan anyway) | It pushed every RecordId into changed_out and then discarded it; W4 E-F B1/B2 went 0.96x -> 1.00x |
+| D-033 | 2026-10-29 | No identity-lambda shortcut for inserted stages | W4 E-F (identity insert before the only reduce) does identical work in B1 and B2, so parity is the bound; a special case for `x => x` would only game that scenario |
+| D-034 | 2026-10-29 | Paper text and tables read every number from bench/published/2026-10-29/benchmark_results.json (before/after table from 2026-10-28) | Numbers cannot drift from what was measured; build_paper.py warns if any ratio is below 1 |
 
 ## Benchmarks after D-013..D-017 (2026-10-28, same runner/protocol as before: 1 warm-up + median of 3; noisy machine)
 | Scenario | B0/B2 before | after run 1 | after run 2 |
@@ -51,11 +60,16 @@
 Absolute times varied up to 3x between runs (W1 first run plain: 363 ms vs 1056 ms), so only ratios that held in both runs should be quoted. Raw output was saved to the session scratchpad only, not to the repo.
 
 ## Open questions (for the human)
-- Q1 (spec change needed): a lambda that reads another stage (e.g. `map(xs, x => x + total)`) does not list that stage in the node's `inputs` (IR_SPEC section 4 says MAP has 1 input), and the memo key ignores it. A modify that changes `total` leaves stale results: `retroc verify` reports `[25, 8, 9]` vs rerun `[25, 17, 18]`. Pre-existing (same on the original code). Fix needs IR_SPEC to add referenced stages as inputs and include their hashes in the memo key.
+- Q1 (RESOLVED 2026-10-29, D-028): a lambda that reads another stage (e.g. `map(xs, x => x + total)`) does not list that stage in the node's `inputs` (IR_SPEC section 4 says MAP has 1 input), and the memo key ignores it. A modify that changes `total` leaves stale results: `retroc verify` reports `[25, 8, 9]` vs rerun `[25, 17, 18]`. Pre-existing (same on the original code). Fix needs IR_SPEC to add referenced stages as inputs and include their hashes in the memo key.
+- Q3: the rebuild-plan note "(reduce is O(n) in v1)" (EDIT_SEMANTICS section 7 example, golden files ex2_*) is now shown only for folds that are not patched (float or non-additive). Reword to e.g. "(fold recomputed)"? Needs a spec + golden change, so not done.
+- Q4: EDIT_SEMANTICS section 6 says JOIN rebuilds its output by hash join; the code also patches output records in place when no key changes and no record is added/removed (same output). Add one line to the spec?
 - Q2: `docs/BENCHMARKS.md` result table is stale (its B1 column measured B2). Update it after the full protocol run?
 
 ## Known bugs
-- BUG-001 (open): stale results when a lambda reads another stage; see Q1.
+- BUG-001 (fixed 2026-10-29, D-028): stale results when a lambda reads another stage.
+- BUG-004 (fixed 2026-10-29): stage lookup by name could return the OUTPUT node, so "insert before X" rewired the output (found by difftest after adding outputs).
+- BUG-005 (fixed 2026-10-29): insert before a stage whose lambda reads another stage failed the downstream type check (referenced names were not declared in the check program).
+- BUG-006 (fixed 2026-10-29, before release): join patch treated a record re-entering the join input as already present; key entries now carry the layout generation.
 - BUG-002 (fixed 2026-10-28): B1 baseline was never implemented (`stage_invalidation_` unused).
 - BUG-003 (fixed 2026-10-28): tree_reduce incremental path silently skipped changed records missing from `record_to_leaf`; it now rebuilds the tree.
 
@@ -76,11 +90,12 @@ Absolute times varied up to 3x between runs (W1 first run plain: 363 ms vs 1056 
 - [x] Final phase (Report and demo complete)
 
 ## Next actions (exact, small)
-1. Get an answer on Q1 (stage refs in lambdas) and Q2 (copy bench/published/2026-10-28 numbers into docs/BENCHMARKS.md) before touching docs/ or IR.
-2. Cost model (Phase 12.2): per edit batch / per stage choose recompute vs patch; targets E-B batches, W2 joins, insert-near-start. Re-run full protocol after (`bench_runner bench/data bench/results --cpu 2 --machine "..."`, ~1h50m).
-3. Hash-collision bound write-up. B3 baseline deferred by user.
+1. Ask the user whether to commit and push the final code, results, paper and docs on perf/incremental-propagation.
+2. Get answers on Q3 (reword "(reduce is O(n) in v1)" note; spec + golden change) and Q4 (document in-place join patch in EDIT_SEMANTICS §6).
+3. Future work only (not scheduled): Phases 12.4-12.6, real datasets, external baseline.
 
 ## Session log (newest first, 2-3 lines each)
+- 2026-10-29 (late): Final benchmark run (5448 s); all 35 scenarios faster than full rerun, W4 E-F at parity with B1 (0.98x). Added join in-place patch unit test (65 cases). Paper text made data-driven for the B1 claim; figures, docx, PDF, README, REPORT regenerated from bench/published/2026-10-29.
 - 2026-10-29: IEEE paper in paper/ (build_paper.py, 20 refs, 3 authors). Pitch deck (19 slides, speaker notes) as a claude.ai artifact. Rewrote demo/prof_demo.ps1 (no hardcoded numbers, MSYS2 PATH, optional -Bench W1-10k run, ~50 s) and demo/DEMO_WALKTHROUGH.md (current numbers, run order, Q&A); clarified comments in demo/edits.rcs. Demo runs end to end; ctest 8/8 pass. README.md/REPORT.md still quote old 10.9x.
 - 2026-10-28: Wrote PROJECT_REPORT.md (rubric-based). Removed the O(n) rescan from propagation (D-013..D-016), implemented B1 (D-017), extended difftest (D-018), added tests/unit/test_incremental.cpp (6 cases). W1 single-record modify went from 1.28x to ~5-6x vs full rerun. Found pre-existing BUG-001 (Q1).
 - 2026-10-27: Final Phase complete. Created `README.md` with full project architecture, build instructions, CLI reference, and benchmark numbers. Authored comprehensive research project report (`REPORT.md`) covering problem, related work, design, edit semantics, tree reduction, benchmark results (W1-W4), and correctness verification. Created interactive end-to-end demo (`demo/pipeline.rc`, `demo/edits.rcs`, `demo/run_demo.bat`, `demo/run_demo.sh`) demonstrating initial execution, 3 retroactive edits, automated verification, and output explanation in under 2 seconds. All 8 CTest suites passed 100%.

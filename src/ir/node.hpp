@@ -105,21 +105,58 @@ struct JoinMemoEntry {
     Value out;
 };
 
+// JOIN key index: RecordId -> {inHash, key fn hash, key}, one table per side
+struct JoinKeyEntry {
+    uint64_t inHash = 0;
+    uint64_t keyFnHash = 0;
+    Value key;
+    uint64_t layoutGen = 0;    // the join layout this record was part of
+};
+
+// Additive REDUCE (Phase 12.2): an int fold (a, x) => a + t(x) equals
+// init + sum of t(x) with wraparound, so one changed record is patched by
+// swapping its term. Stores each record's term t(x).
+struct SumReduceMemo {
+    // (RecordId, t(x)) sorted by RecordId, like the input collection (I7), so
+    // a full fold fills it with push_back and a patch finds a record by
+    // binary search
+    std::vector<std::pair<RecordId, int64_t>> terms;
+    uint64_t fnHash = 0;
+    uint64_t initHash = 0;
+    int64_t init = 0;
+    uint64_t sum = 0;          // sum of terms mod 2^64
+    bool valid = false;
+};
+
 // Unified Memo table for a node
 struct Memo {
     std::unordered_map<RecordId, MapMemoEntry> map_memo;
     std::unordered_map<RecordId, FilterMemoEntry> filter_memo;
     ReduceMemoEntry reduce_memo;
+    SumReduceMemo sum_memo;
     TreeReduceMemo tree_reduce_memo;
     ScalarMemoEntry scalar_memo;
     std::unordered_map<JoinPairKey, JoinMemoEntry, JoinPairHash> join_memo;
+    std::unordered_map<RecordId, JoinKeyEntry> join_left_keys;
+    std::unordered_map<RecordId, JoinKeyEntry> join_right_keys;
+    // JOIN output layout: the (left, right) RecordIds at each output position
+    // and, per input record, the positions it appears in. Lets an edit that
+    // keeps every key patch the affected output records in place.
+    std::vector<std::pair<RecordId, RecordId>> join_pairs;
+    std::unordered_map<RecordId, std::vector<size_t>> join_left_pos;
+    std::unordered_map<RecordId, std::vector<size_t>> join_right_pos;
+    bool join_layout_valid = false;
+    uint64_t join_layout_gen = 0;  // bumped by every full join
 
     // Number of recorded entries
     size_t size() const {
         if (!map_memo.empty()) return map_memo.size();
         if (!filter_memo.empty()) return filter_memo.size();
-        if (!join_memo.empty()) return join_memo.size();
+        if (!join_left_keys.empty() || !join_right_keys.empty()) {
+            return join_left_keys.size() + join_right_keys.size() + join_memo.size();
+        }
         if (tree_reduce_memo.valid) return tree_reduce_memo.tree.size();
+        if (sum_memo.valid) return sum_memo.terms.size();
         if (reduce_memo.valid) return 1;
         if (scalar_memo.valid) return 1;
         return 0;
@@ -129,9 +166,16 @@ struct Memo {
         map_memo.clear();
         filter_memo.clear();
         reduce_memo = ReduceMemoEntry{};
+        sum_memo = SumReduceMemo{};
         tree_reduce_memo = TreeReduceMemo{};
         scalar_memo = ScalarMemoEntry{};
         join_memo.clear();
+        join_left_keys.clear();
+        join_right_keys.clear();
+        join_pairs.clear();
+        join_left_pos.clear();
+        join_right_pos.clear();
+        join_layout_valid = false;
     }
 
     // Memory accounting in bytes
@@ -161,6 +205,10 @@ struct Node {
     NodeStatus status = NodeStatus::CLEAN;
     float cost = 1.0f;            // estimated cost units per record evaluation
     Memo memo;                    // per-record table
+    // I3 memo key for the current run: fnHash mixed with the output hashes of
+    // the stages its expressions read by name (inputs past the collection
+    // inputs). Set by the executor/propagator right before the node runs.
+    uint64_t memoKey = 0;
 
     Node clone() const {
         Node n;
@@ -180,8 +228,23 @@ struct Node {
         n.status = status;
         n.cost = cost;
         n.memo = memo;
+        n.memoKey = memoKey;
         return n;
     }
 };
+
+// Number of leading inputs that are collections the node iterates over
+// (MAP/FILTER/REDUCE/TREE_REDUCE: 1, JOIN: 2, OUTPUT: 1). Later inputs are
+// stages read by name inside fn/init/expr (IR_SPEC section 4); every input of
+// a SCALAR is such a reference.
+size_t collection_arity(NodeKind kind);
+
+// True if consumer reads producer by name (a reference input, not an
+// iterated collection). A change to such a producer can change every record.
+bool reads_by_name(const Node& consumer, const NodeId& producer);
+
+// For a REDUCE whose fold is (a, x) => a + t(x) or t(x) + a over ints, with t
+// not reading `a` or any stage, returns t; otherwise nullptr.
+const ExprIR* additive_reduce_term(const Node& node);
 
 } // namespace retroc

@@ -87,6 +87,10 @@ struct Value {
     // 64-bit structural hash
     uint64_t hash() const;
 
+    // Hash consistent with operator==: equal values hash equally (0.0 and -0.0
+    // compare equal but have different bits). Used to bucket join keys.
+    uint64_t equality_hash() const;
+
     // Deterministic string representation per LANGUAGE_SPEC.md section 6
     std::string to_string() const;
 };
