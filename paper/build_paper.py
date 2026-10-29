@@ -596,8 +596,30 @@ def content():
 
     # ---------------- VI. Algorithm ----------------
     H1("Algorithm")
-    P("Algorithm 1 gives the shared propagation loop used by all three edits, and Algorithm 2 the patch step "
-      "for a MAP or FILTER stage.")
+    P("Fig. 2 shows the complete control flow, from source text to verified outputs. Part A runs once. "
+      "The program is lexed and parsed (step 1) and checked for types, scopes and purity (step 2); any error "
+      "stops compilation with a code and a line:col position. The IR builder then produces the Retroactive IR "
+      "in topological order (step 3), lambda bodies are compiled to bytecode (step 4), and the executor runs "
+      "every stage once, filling the per-record memo tables and collection hashes (step 5).")
+    P("Part B repeats for each edit in the script. The edit is read (step 6) and applied to a snapshot of "
+      "the graph; inserts and deletes re-sort the stages with Kahn's algorithm [@kahn], and the result is "
+      "type-checked (step 7). An invalid edit, for example one that creates a cycle, restores the snapshot "
+      "and reports E601, so the graph is unchanged. A valid edit seeds the work set *W* with the first "
+      "affected stages and the pending record IDs (step 8). Stages are then visited in topological order "
+      "(step 9). If more than an eighth of a stage's records are pending, one full pass with per-record memo "
+      "checks is cheaper; otherwise only the pending records are patched (step 10). The collection hash is "
+      "updated in *O*(1) per changed record (step 11). If the stage's output hash is unchanged, propagation "
+      "stops there (early cutoff); otherwise its version is increased and only the changed record IDs are "
+      "forwarded to its consumers (step 12). When no dirty stages remain, the changed outputs are refreshed "
+      "and the rebuild plan is printed (step 13). After the last edit, `retroc verify` can rewrite the "
+      "source, rerun it from scratch and compare the outputs (step 14).")
+    FIGURE("fig2_flowchart.png",
+           "End-to-end flowchart of RetroC. Part A compiles and runs the program once; Part B applies each "
+           "retroactive edit and propagates it stage by stage. Steps 10 and 11 apply to MAP and FILTER "
+           "stages; REDUCE, JOIN and scalar stages recompute unless their memo matches, and tree_reduce "
+           "updates one leaf-to-root path.", width_in=3.0)
+    P("Algorithm 1 gives the shared propagation loop used by all three edits (steps 8–12 of Fig. 2), and "
+      "Algorithm 2 the patch step for a MAP or FILTER stage.")
     CODEBOX("Algorithm 1. PROPAGATE(G, W)", [
         "Input: graph G, work set W = (dirty, fullScan,",
         "       pending: node -> set of RecordIds)",
@@ -727,10 +749,10 @@ def content():
     # ---------------- IX. Results ----------------
     H1("Results")
     H2("Single-Record Edits")
-    P("Fig. 2 shows the speedup of RetroC over a full rerun when one input record is modified. On W1 it is "
+    P("Fig. 3 shows the speedup of RetroC over a full rerun when one input record is modified. On W1 it is "
       "9.63×, 9.87× and 10.05× at 10 k, 100 k and 1 M records, and on the 12-stage W3 "
       "it is 22.39×. W4, which has only one map before its fold, gains 3.37×. On the small join "
-      "workload W2 RetroC is slower than a rerun (0.40×). Fig. 3 shows the absolute times: all three "
+      "workload W2 RetroC is slower than a rerun (0.40×). Fig. 4 shows the absolute times: all three "
       "systems scale linearly with input size, and RetroC stays an order of magnitude below both baselines "
       "at every size.")
     FIGURE("fig2_single_edit.png",
@@ -745,7 +767,7 @@ def content():
       "which is exactly what `tree_reduce` removes for associative combiners.")
 
     H2("All Scenarios")
-    P("Table VI lists all 35 scenarios and Fig. 4 compares the edit kinds on W1-100k and W3. RetroC beats a "
+    P("Table VI lists all 35 scenarios and Fig. 5 compares the edit kinds on W1-100k and W3. RetroC beats a "
       "full rerun on single-record edits, on inserts near the end of the pipeline (3.0–4.8× on W1 and "
       "W3, 12.1× on W2), on identity inserts (2.5–5.0×, 12.0× on W2) and on deletes "
       "(1.4–2.3× on W1 and W3, 20.2× on W2). It breaks even or loses when an insert near the start "
@@ -798,7 +820,7 @@ def content():
                "hour). All 35 scenarios passed the verifier.")
 
     H2("Record-Level Versus Stage-Level Reuse")
-    P("Fig. 5 isolates the value of record granularity by comparing RetroC with stage-level invalidation. For "
+    P("Fig. 6 isolates the value of record granularity by comparing RetroC with stage-level invalidation. For "
       "edits to input records the difference is large: 9.5–9.6× on W1 and 19.6–20.1× on W3, for a "
       "single edit and for batches alike, because B1 recomputes every record of every downstream stage. For "
       "structural edits the picture is different. An inserted or re-wired stage must be evaluated on every "
@@ -810,7 +832,7 @@ def content():
 
     H2("Effect of Record-Proportional Propagation")
     P("An earlier version of the propagator visited, hashed and copied every record of every dirty stage. "
-      "Fig. 6 compares it with the record-proportional design on W1-100k using the same, earlier and less "
+      "Fig. 7 compares it with the record-proportional design on W1-100k using the same, earlier and less "
       "strict timing protocol (one warm-up and median of three, unpinned) for both. The single-record speedup "
       "rose from 1.28× to 5.42×, the late insert from 1.31× to 5.21×, and the delete from "
       "0.86× to 2.20×, while operation counts were unchanged: the work avoided was bookkeeping, not "

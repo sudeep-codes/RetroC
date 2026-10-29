@@ -225,6 +225,159 @@ def fig_before_after():
     save(fig, "fig6_before_after.png")
 
 
+# --- Fig. 2: end-to-end flowchart -------------------------------------------
+def fig_flowchart():
+    W, H = 10.0, 26.0
+    fig, ax = plt.subplots(figsize=(COL_W, COL_W * H / W))
+    ax.set_xlim(0, W)
+    ax.axis("off")
+
+    PROC, DEC, TERM, IO, SIDE = "#eef4fc", "#fdf0ea", "#e8f7f1", "#f3f2ee", "#ffffff"
+    CX, BW = 4.0, 5.2             # main column centre and box width
+    SX, SW = 8.35, 2.95           # side column centre and box width
+    GAP = 0.34
+    FS, FS_SIDE = 6.0, 5.5
+
+    def arrow(x1, y1, x2, y2, label=None, lx=0.0, ly=0.0):
+        ax.annotate("", xy=(x2, y2), xytext=(x1, y1),
+                    arrowprops=dict(arrowstyle="-|>", lw=0.6, color=INK2, mutation_scale=6,
+                                    shrinkA=0, shrinkB=0))
+        if label:
+            ax.text((x1 + x2) / 2 + lx, (y1 + y2) / 2 + ly, label, fontsize=5.6, color=INK2,
+                    style="italic", ha="center", va="center")
+
+    def path(points, label=None, lpos=None):
+        xs, ys = zip(*points[:-1])
+        ax.plot(xs, ys, color=INK2, lw=0.6, solid_capstyle="butt")
+        arrow(points[-2][0], points[-2][1], points[-1][0], points[-1][1])
+        if label:
+            ax.text(lpos[0], lpos[1], label, fontsize=5.6, color=INK2, style="italic",
+                    ha="center", va="center")
+
+    def number(n, top, left):
+        # step badge on the box's top-left corner, clear of the loop arrows
+        ax.add_patch(matplotlib.patches.Circle((left, top), 0.21, facecolor=INK,
+                                               edgecolor="white", linewidth=0.6, zorder=3))
+        ax.text(left, top, str(n), fontsize=5.0, color="white", ha="center",
+                va="center", fontweight="bold", zorder=4)
+
+    def shape(kind, x, yc, w, h, text, fill, fs=FS):
+        if kind == "proc":
+            ax.add_patch(FancyBboxPatch((x - w / 2, yc - h / 2), w, h,
+                                        boxstyle="round,pad=0,rounding_size=0.08",
+                                        linewidth=0.6, edgecolor=INK2, facecolor=fill))
+        elif kind == "term":
+            ax.add_patch(FancyBboxPatch((x - w / 2, yc - h / 2), w, h,
+                                        boxstyle=f"round,pad=0,rounding_size={h / 2}",
+                                        linewidth=0.6, edgecolor=INK2, facecolor=fill))
+        elif kind == "io":
+            s = 0.25
+            ax.add_patch(matplotlib.patches.Polygon(
+                [(x - w / 2 + s, yc + h / 2), (x + w / 2 + s, yc + h / 2),
+                 (x + w / 2 - s, yc - h / 2), (x - w / 2 - s, yc - h / 2)],
+                closed=True, linewidth=0.6, edgecolor=INK2, facecolor=fill))
+        elif kind == "dec":
+            ax.add_patch(matplotlib.patches.Polygon(
+                [(x, yc + h / 2), (x + w / 2, yc), (x, yc - h / 2), (x - w / 2, yc)],
+                closed=True, linewidth=0.6, edgecolor=INK2, facecolor=fill))
+        ax.text(x, yc, text, fontsize=fs, color=INK, ha="center", va="center", linespacing=1.12)
+
+    cur = [H - 0.35]
+    nodes = {}
+
+    def main(key, kind, text, h, n=None, link=True, label=None):
+        top = cur[0]
+        yc = top - h / 2
+        w = {"dec": 3.6, "term": 3.0, "io": BW - 0.6}.get(kind, BW)
+        fill = {"proc": PROC, "dec": DEC, "term": TERM, "io": IO}[kind]
+        shape(kind, CX, yc, w, h, text, fill)
+        if n is not None:
+            number(n, top, CX - w / 2 + (0.25 if kind == "io" else 0.0) - 0.08)
+        if link and nodes:
+            prev = nodes[list(nodes)[-1]]
+            arrow(CX, prev["bot"], CX, top, label, lx=0.35)
+        nodes[key] = dict(yc=yc, top=top, bot=top - h, w=w, h=h)
+        cur[0] = top - h - GAP
+
+    def side(key, text, yc, h):
+        shape("proc", SX, yc, SW, h, text, SIDE, fs=FS_SIDE)
+        nodes[key] = dict(yc=yc, top=yc + h / 2, bot=yc - h / 2, w=SW, h=h, side=True)
+
+    def side_from(dec_key, side_key, text, h, label):
+        d = nodes[dec_key]
+        side(side_key, text, d["yc"], h)
+        arrow(CX + d["w"] / 2, d["yc"], SX - SW / 2, d["yc"], label, ly=0.17)
+
+    def band(title, top, bot):
+        ax.add_patch(FancyBboxPatch((0.08, bot), W - 0.16, top - bot,
+                                    boxstyle="round,pad=0,rounding_size=0.18", linewidth=0.6,
+                                    edgecolor=GRID, facecolor="none", linestyle=(0, (3, 2))))
+        ax.text(W - 0.3, top - 0.28, title, fontsize=6.2, color=INK, fontweight="bold",
+                ha="right", va="center")
+
+    # ---- A. first run ----
+    a_top = cur[0]
+    cur[0] -= 0.55
+    main("start", "term", "Start: program.rc", 0.55, link=False)
+    main("parse", "proc", "Lex and parse into a syntax tree", 0.55, 1)
+    main("sema", "proc", "Type, scope and purity checks", 0.55, 2)
+    main("err", "dec", "Errors?", 0.8, label=None)
+    side_from("err", "stop", "Report code and\nline:col; stop", 0.6, "yes")
+    main("ir", "proc", "Build the Retroactive IR\n(versioned DAG, topological order)", 0.75, 3, label="no")
+    main("bc", "proc", "Compile lambda bodies to bytecode", 0.55, 4)
+    main("run", "proc", "Run stages in order; fill per-record\nmemo tables and collection hashes", 0.75, 5)
+    main("out", "io", "Initial outputs", 0.55)
+    a_bot = nodes["out"]["bot"] - 0.2
+    band("A.  First run (once)", a_top, a_bot)
+
+    # ---- B. each edit ----
+    cur[0] = a_bot - 0.3
+    b_top = cur[0]
+    cur[0] -= 0.55
+    main("read", "io", "Read the next edit from edits.rcs", 0.55, 6, link=False)
+    arrow(CX, nodes["out"]["bot"], CX, nodes["read"]["top"])
+    main("apply", "proc", "Snapshot graph; apply the edit;\nre-sort stages (Kahn); type-check",
+         0.75, 7)
+    main("valid", "dec", "Edit valid?", 0.8)
+    side_from("valid", "rollback", "Roll back to the\nsnapshot; report E601", 0.6, "no")
+    main("seed", "proc", "Seed work set W: dirty stages\nand pending record IDs", 0.75, 8, label="yes")
+    main("visit", "proc", "Visit the next dirty stage v\nin topological order", 0.75, 9)
+    main("big", "dec", "Pending > n/8?", 0.8)
+    side_from("big", "full", "One full pass,\nmemo check per record", 0.6, "yes")
+    main("patch", "proc", "Patch pending records (binary\nsearch); rerun lambda on memo miss",
+         0.75, 10, label="no")
+    main("hash", "proc", "Update collection hash in O(1)", 0.55, 11)
+    f = nodes["full"]
+    path([(SX, f["bot"]), (SX, nodes["hash"]["yc"]), (CX + BW / 2, nodes["hash"]["yc"])])
+    main("chg", "dec", "Output hash\nchanged?", 1.05)
+    side_from("chg", "cut", "Early cutoff:\nconsumers untouched", 0.6, "no")
+    main("fwd", "proc", "Bump version; mark consumers\ndirty; forward changed IDs", 0.75, 12,
+         label="yes")
+    main("more", "dec", "More dirty\nstages?", 1.05)
+    c, m = nodes["cut"], nodes["more"]
+    path([(SX, c["bot"]), (SX, m["yc"]), (CX + m["w"] / 2, m["yc"])])
+    # loop back to step 9
+    xl = 0.85
+    path([(CX - m["w"] / 2, m["yc"]), (xl, m["yc"]), (xl, nodes["visit"]["yc"]),
+          (CX - BW / 2, nodes["visit"]["yc"])], "yes", (xl + 0.42, m["yc"] + 0.2))
+    main("plan", "proc", "Refresh changed outputs;\nprint the rebuild plan", 0.75, 13, label="no")
+    main("edits", "dec", "More edits?", 0.8)
+    e = nodes["edits"]
+    xl2 = 0.42
+    path([(CX - e["w"] / 2, e["yc"]), (xl2, e["yc"]), (xl2, nodes["read"]["yc"]),
+          (CX - (BW - 0.6) / 2 - 0.2, nodes["read"]["yc"])], "yes", (xl2 + 0.42, e["yc"] + 0.2))
+    main("verify", "proc", "Optional verify: rewrite source,\nrerun from scratch, compare",
+         0.75, 14, label="no")
+    main("end", "term", "End", 0.5)
+    b_bot = nodes["end"]["bot"] - 0.2
+    band("B.  Each retroactive edit", b_top, b_bot)
+    lo = b_bot - 0.1
+    ax.set_ylim(lo, H)
+    fig.set_size_inches(COL_W, COL_W * (H - lo) / W)
+    save(fig, "fig2_flowchart.png")
+
+
+fig_flowchart()
 fig_architecture()
 fig_single_edit()
 fig_scenarios("b0", "b2", "Speedup over full rerun", "fig3_scenarios_b0.png")
