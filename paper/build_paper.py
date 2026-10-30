@@ -376,11 +376,11 @@ AUTHORS = [
 ]
 
 ABSTRACT = (
-    "Data pipelines are routinely corrected after they have run: a faulty input record is fixed, a record is "
-    "added or withdrawn, a missing cleaning stage is inserted, or an obsolete stage is removed. Common practice "
-    "either reruns the whole pipeline or reruns every stage downstream of the change, while incremental "
-    "dataflow engines that avoid this fix the shape of the computation when it is built. This paper presents "
-    "RetroC, a compiler and runtime for a pure, statically typed dataflow language in which retroactive "
+    "Once a data pipeline has produced its results, people still change it: they repair a bad input record, "
+    "add or withdraw a record, slot in a cleaning stage that was forgotten, or drop a stage that is no longer "
+    "needed. Today such a change usually means running the whole pipeline again, or at least every stage after "
+    "the change, and the incremental dataflow engines that avoid this cannot change the shape of a "
+    "computation once it is built. We present RetroC, a compiler and runtime for a pure, statically typed dataflow language in which retroactive "
     "edits—modifying, inserting or deleting an input record, and inserting or deleting a stage—are "
     "first-class, type-checked, atomic operations on a versioned dataflow graph called the Retroactive IR. "
     "After an edit, RetroC propagates a record-level work set: each stage visits only the records whose inputs "
@@ -404,35 +404,36 @@ KEYWORDS = ("incremental computation, dataflow programming, compilers, intermedi
 def content():
     # ---------------- I. Introduction ----------------
     H1("Introduction")
-    P("Dataflow pipelines—chains of *map*, *filter*, *reduce* and *join* stages over collections of "
-      "records—are the backbone of extract-transform-load jobs, feature engineering and scientific data "
-      "analysis. They are rarely written once and left alone. A sensor log turns out to contain a corrupt "
-      "reading; an analyst realises that values must be calibrated *before* they are aggregated; a debugging "
-      "stage becomes obsolete. Each of these is a *retroactive* edit: it changes the history of a computation "
-      "that has already run, and the user wants the outputs that the edited pipeline would have produced.")
-    P("The usual way to obtain those outputs is to run the pipeline again. Batch engines recompute every stage "
-      "for every record [@spark], and workflow orchestrators and build tools track dependencies between whole "
-      "stages or files, so a single changed record invalidates every downstream stage in full [@workflow]; "
-      "[@buildsys]. Incremental computation research shows that far less work is needed when only a small part "
-      "of the input changes [@acar02]; [@adapton], and incremental dataflow engines propagate *differences* "
-      "through a dataflow graph with impressive efficiency [@ddflow]; [@naiad]. These engines, however, fix "
-      "the topology of the computation when it is built: inserting or deleting a stage is outside their model "
-      "and requires rebuilding the computation.")
-    P("This paper treats the pipeline’s own structure as editable history. RetroC compiles a small, pure "
-      "dataflow language into a versioned dataflow graph, the *Retroactive IR*, executes it once while "
-      "recording per-record memo tables, and then accepts edit scripts that modify past input records, insert "
-      "stages or delete stages. Each edit is type-checked and applied atomically, and its effect is propagated "
-      "through the graph at the granularity of individual records.")
+    P("Many data-processing jobs are written as a chain of *map*, *filter*, *reduce* and *join* steps applied "
+      "to a list of records: cleaning a sensor log, preparing features for a model, or summarising lab "
+      "measurements. Such a chain seldom stays fixed after its first run. Someone spots a broken temperature "
+      "reading; an analyst decides a calibration step belongs ahead of the averaging step; a stage added for "
+      "debugging is no longer wanted. We call each of these changes *retroactive*, since it alters a "
+      "computation whose results already exist, and what the user asks for is the output the corrected "
+      "pipeline would have given from the start.")
+    P("In practice, people get that output by running everything again. A batch engine repeats each stage over "
+      "each record [@spark]. Workflow schedulers and build tools are smarter about *which* steps to repeat, but "
+      "they reason about whole steps or files, so one altered record still forces every later step to run in "
+      "full [@workflow]; [@buildsys]. Work on incremental computation has long argued that a small change to "
+      "the input should cost only a small amount of work [@acar02]; [@adapton], and incremental dataflow "
+      "engines achieve this for input changes by passing *differences* along the graph [@ddflow]; [@naiad]. "
+      "In those engines, though, the graph is settled once it is constructed; adding or removing an operator "
+      "means building a new computation.")
+    P("Our approach is to let the pipeline’s structure be edited after the fact, just like its data. RetroC "
+      "compiles a small, pure dataflow language into a versioned graph that we call the *Retroactive IR*. It "
+      "runs that graph once, keeping a memo entry for every record at every stage, and then accepts scripts "
+      "of edits that change past input records or add and remove stages. Each edit is type-checked, takes "
+      "effect atomically, and is pushed through the graph one record at a time.")
 
     H2("Motivation")
-    P("Two observations motivate the design. First, in a *pure* language a stage’s output for a record is "
-      "fully determined by that record’s input value and the stage’s function. Purity therefore makes "
-      "record-level reuse sound without any runtime dependency tracing: if neither the input value nor the "
-      "function changed, the cached output is still correct. Second, users who edit a pipeline need to *trust* "
-      "and *understand* the result. An incremental engine that silently returns a different answer from a full "
-      "rerun is worse than no engine at all, and one that cannot say what it recomputed is hard to debug. "
-      "RetroC therefore pairs incremental propagation with a built-in verifier and a human-readable rebuild "
-      "plan for every edit.")
+    P("The design rests on two observations. The first is that, when the language has no side effects, what a "
+      "stage produces for a given record depends on nothing but that record’s value and the stage’s code. A "
+      "cached result can therefore be reused whenever neither of those two has changed, and no dependency "
+      "tracking is needed while the program runs. The second is that a person who edits a pipeline must be "
+      "able to rely on the answer and to see how it was obtained. A fast incremental answer that quietly "
+      "differs from a fresh run is useless, and one that hides what it recomputed is hard to debug. For this "
+      "reason RetroC ships its propagation together with a checker against a full rerun and a readable "
+      "rebuild plan for each edit.")
 
     H2("Problem Statement")
     P("Let *P* be a well-typed program, *I* its input data, and *S* the state left by executing *P* on *I* "
@@ -464,53 +465,60 @@ def content():
 
     # ---------------- II. Literature review ----------------
     H1("Literature Review")
-    P("RetroC draws on several lines of work. This section summarises each and states how RetroC relates to "
-      "it; Table I compares the approaches along the properties that matter for retroactive editing.")
+    P("Six strands of earlier work bear on RetroC. For each we give the idea in brief and say where RetroC "
+      "agrees or departs; Table I sets the approaches side by side on the properties that retroactive "
+      "editing needs.")
 
     H2("Batch Reprocessing and Workflow Systems")
-    P("Data-parallel batch engines recompute results from their inputs, and some can recover lost partitions "
-      "from recorded lineage [@spark]. Workflow management systems and build tools such as Make "
-      "decide *which tasks* to rerun from a dependency graph between tasks or files [@workflow]. "
-      "Their unit of reuse is the whole task: a one-record change to a task’s input reruns that task and "
-      "every task after it in full. RetroC’s stage-level baseline (B1 in Section VIII) models this behaviour.")
+    P("Cluster batch engines such as Spark produce results by evaluating the job over its inputs; their "
+      "lineage records are used to rebuild data lost to failures rather than to avoid recomputation after "
+      "an edit [@spark]. Workflow schedulers and build tools in the style of Make keep a graph of tasks or "
+      "files and use it to pick the tasks that must run again [@workflow]. A task is the smallest thing they "
+      "can skip, so changing one record of a task’s input repeats that task and all tasks that follow it. "
+      "The stage-level baseline B1 of Section VIII imitates exactly this policy.")
 
     H2("Build Systems and Early Cutoff")
-    P("Mokhov et al. characterise build systems by their scheduling and rebuilding strategies and identify "
-      "*early cutoff*—stopping when a rebuilt target is unchanged—as a key property [@buildsys]. Build "
-      "tools with dynamic dependencies and query-based compilers apply the same idea to tasks and to "
-      "compiler queries. RetroC applies early cutoff at two levels: per "
-      "record, through memo hits, and per stage, through the collection hash.")
+    P("In their survey of build systems, Mokhov et al. separate the order in which tasks are scheduled from "
+      "the rule that decides whether a task is rebuilt, and they single out *early cutoff*: if a rebuilt "
+      "result equals the old one, nothing that depends on it needs rebuilding [@buildsys]. The same "
+      "short-circuit appears in build tools with dynamic dependencies and in compilers organised around "
+      "cached queries. RetroC uses it twice—once for a single record, when its memo entry still fits, and "
+      "once for a whole stage, when the stage’s collection hash has not moved.")
 
     H2("Self-Adjusting and Demand-Driven Computation")
-    P("Self-adjusting computation records a dynamic dependence graph during execution and re-executes only "
-      "the affected parts after an input change [@acar02]; selective memoization keys memo entries on the "
-      "values a computation actually uses [@acar03]. Adapton makes incremental computation demand-driven and "
-      "composable [@adapton]. These systems are general-purpose and trace dependencies at runtime. RetroC is "
-      "narrower: it exploits the static structure of a pure collection pipeline, so the dependency structure "
-      "is the compiled graph itself and no tracing is needed. In exchange, it adds structural edits of the "
-      "program, which are not part of these models.")
+    P("Acar et al. build, while a program runs, a graph of which computations read which data, and after an "
+      "input change they replay only the parts of that graph the change reaches [@acar02]. Their follow-up on "
+      "selective memoization makes a cache entry depend only on the parts of the input a function really "
+      "inspected [@acar03]. Adapton recasts the same goal so that results are recomputed on demand and pieces "
+      "compose cleanly [@adapton]. These are general techniques that discover dependencies at run time. "
+      "RetroC targets a narrower setting—pure pipelines over collections—where the compiled graph already "
+      "states every dependency, so no run-time tracing is required; what it adds in return is the ability to "
+      "edit the program’s structure, which those models do not cover.")
 
     H2("Incremental Dataflow and View Maintenance")
-    P("Differential dataflow represents collections as accumulated differences and propagates input changes "
-      "through a fixed dataflow graph [@ddflow], built on the timely dataflow model of Naiad [@naiad]. Database "
-      "incremental view maintenance derives update rules for materialised views from query definitions "
-      "[@ivm]. Stream processors handle unbounded, time-advancing inputs [@streaming]. All of these "
-      "excel at input changes; none treats inserting or deleting an operator in an already-running "
-      "computation as an incremental update.")
+    P("Differential dataflow stores each collection as a history of additions and retractions and pushes "
+      "input changes through an operator graph that does not change shape [@ddflow]; it runs on Naiad’s "
+      "timely dataflow model [@naiad]. In databases, incremental view maintenance works out from a view’s "
+      "query how to update the stored view when base tables change [@ivm]. Stream processing systems are "
+      "built for inputs that never end and that arrive in time order [@streaming]. Each of these handles "
+      "changing *data* very well, yet none of them regards adding or dropping an operator in a computation "
+      "that has already run as just another incremental update.")
 
     H2("Incremental Programs and Compilers")
-    P("The incremental lambda calculus derives programs that map input changes to output changes for "
-      "higher-order languages [@ilc]. Reactive notebooks re-execute the cells that depend on an edited cell, "
-      "which is again stage-level reuse. RetroC is a compiler in the conventional sense—lexer, "
-      "parser, type checker, IR, bytecode—whose IR is designed to be *edited* after execution.")
+    P("Cai et al. give a calculus that, from a higher-order program, derives a second program turning a "
+      "change in the input into the matching change in the output [@ilc]. Reactive notebooks rerun every "
+      "cell downstream of a cell the user edits—once more, reuse at the granularity of a whole step. "
+      "RetroC, by contrast, is an ordinary compiler, with a lexer, parser, type checker, IR and bytecode, "
+      "except that its IR is meant to be *modified* after the program has executed.")
 
     H2("Retroactivity, Provenance and Testing")
-    P("The term *retroactive* comes from retroactive data structures, which support inserting or deleting "
-      "operations in the past of a data structure’s history [@retrods]; RetroC borrows the idea, not the "
-      "technique. Its *explain* command relates to data provenance, which tracks why and where an output "
-      "value came from [@provenance]. Its verification strategy follows differential testing, which compares "
-      "two implementations of the same specification on generated inputs [@difftest]; [@csmith], and "
-      "metamorphic testing, which checks relations between related executions [@metamorphic].")
+    P("We take the word *retroactive* from Demaine et al., whose retroactive data structures let an operation "
+      "be added to or removed from an earlier point in the structure’s history [@retrods]; RetroC shares the "
+      "goal but none of the machinery. The *explain* command is a small form of data provenance, which "
+      "answers why an output has its value and where that value came from [@provenance]. For testing we "
+      "follow differential testing, which runs two implementations that should agree on many generated "
+      "inputs and flags any disagreement [@difftest]; [@csmith], and metamorphic testing, which checks that "
+      "related runs stand in an expected relation to each other [@metamorphic].")
 
     TABLE("Comparison of Approaches to Recomputation After a Change",
           ["Approach", "Input edits", "Stage edits", "Reuse unit", "Verifier"],
@@ -526,10 +534,10 @@ def content():
 
     # ---------------- III. Research gap ----------------
     H1("Research Gap")
-    P("The literature offers either reuse at the level of whole stages or tasks, which is simple and correct "
-      "but recomputes every record of every downstream stage, or fine-grained incremental computation over a "
-      "computation whose shape is fixed when it is built. We found no system in which all of the following "
-      "hold together:")
+    P("Existing work splits into two camps. One reuses whole stages or tasks; this is easy to get right but "
+      "still repeats every record of every stage after the change. The other reuses work at a fine grain, "
+      "but only inside a computation whose shape cannot change once built. In the systems we surveyed, we "
+      "did not find one that offers all four of the following at once:")
     BUL([
         "edits to past input records *and* structural edits that insert or delete stages are first-class, "
         "type-checked operations on the compiled program;",
@@ -673,11 +681,12 @@ def content():
     EQ(eq("*S*′ = *S* − *t*(*r*, *v*~old~) + *t*(*r*, *v*~new~),"), 3)
     P0("and insertion or removal adds or subtracts one term. Order is still captured: by invariant I7 every "
        "collection is sorted by unique RecordIds, so the set of (*r*, *v*) pairs determines the sequence. "
-       "Sum-based multiset hashes are a known construction [@inchash]. They are not collision-resistant "
-       "against an adversary, but RetroC’s inputs are not adversarial. If the terms behave like independent "
-       "uniform 64-bit values, the probability that any of *q* compared states collide is at most "
-       "*q*^2^/2^65^ by the birthday bound, which is below 10^−8^ even for *q* = 10^5^ comparisons. "
-       "The verifier compares full values, not hashes, so a collision cannot go undetected in a verified run.")
+       "Hashing a multiset by adding up per-element terms is not new [@inchash]. Such a hash can be broken on "
+       "purpose by someone who chooses the data, but RetroC does not face such an opponent. Treating each "
+       "term as an independent, uniformly random 64-bit number, a collision among *q* compared states has "
+       "probability at most *q*^2^/2^65^ (the birthday bound); for *q* = 10^5^ that is under 10^−8^. "
+       "Because the verifier compares the values themselves rather than their hashes, a verified run would "
+       "still expose any collision that did occur.")
 
     H2("Correctness Argument")
     P("*Claim.* For every well-typed program *P*, input *I* and valid edit *e*, propagating *e* from the state "
@@ -1055,10 +1064,10 @@ def content():
 
     # ---------------- XI. Discussion ----------------
     H1("Discussion")
-    P("*Why the speedup grows with size.* With the incremental sum and hash join, every stage on the path of "
-      "a changed record does constant or logarithmic work, so the cost of an edit no longer depends on the "
-      "input size while the cost of a rerun grows linearly. This is the property incremental computation "
-      "aims for, and Fig. 4 shows it directly.")
+    P("*Why the speedup grows with size.* Once sums and joins are updated in place, each stage that a changed "
+      "record passes through spends constant or logarithmic time on it. An edit therefore costs about the same "
+      "at 10 k and at 1 M records, whereas a rerun gets slower in direct proportion to the data. Fig. 4 makes "
+      "this visible: the RetroC line is flat while both baselines climb.")
     P("*Batches.* Sequential edits are now patched one by one at a fraction of a millisecond each, so a batch "
       f"of 100 edits is still {RANGE(keys_for(['E-B']))} faster than one rerun. Stage-level invalidation "
       "must recompute the pipeline once per edit, which is why its batches are the slowest configuration in "
@@ -1072,9 +1081,9 @@ def content():
       "performance or an efficiency core and on thermal state. Pinning to one performance core and timing all "
       "systems round-robin reduced the spread within a scenario to about ±10%. We recommend both "
       "practices for incremental-computation benchmarks on consumer hardware.")
-    P("*Threats to validity.* The workloads are synthetic, the language is small, and all measurements come "
-      "from one machine. The results support claims about this design on these workloads; Section XII lists "
-      "the remaining scope boundaries.")
+    P("*Threats to validity.* Our data is generated rather than collected, our language has few features, and "
+      "every number comes from a single laptop. The results therefore speak for this design on these "
+      "workloads and should not be read more broadly; Section XII spells out what remains outside scope.")
 
     # ---------------- XII. Limitations ----------------
     H1("Limitations")
@@ -1091,10 +1100,10 @@ def content():
 
     # ---------------- XIII. Conclusion ----------------
     H1("Conclusion")
-    P("RetroC shows that modifying, inserting and deleting past input records and inserting and deleting "
-      "stages can be handled as typed, atomic, first-class operations of a compiler for a pure dataflow "
-      "language, and that their effects can be propagated record by record with work proportional to what "
-      f"changes. A single-record edit runs {RANGE(keys_for(['E-A'], W1S))} faster than a full rerun on a "
+    P("With RetroC we have shown that, for a pure dataflow language, a compiler can treat changes to past "
+      "input records and the addition or removal of stages as ordinary typed and atomic operations, and can "
+      "carry their effects forward one record at a time so that the work done tracks the amount that "
+      f"actually changes. A single-record edit runs {RANGE(keys_for(['E-A'], W1S))} faster than a full rerun on a "
       f"sensor pipeline from 10 k to 1 M records, {X('W3', 'E-A')} faster on a 12-stage pipeline and "
       f"{X('W2', 'E-A')} faster on a join, and every one of the {N_SCEN} measured scenarios is faster than a "
       f"full rerun and either faster than or on par with stage-level invalidation. Every result matched a full rerun across "
@@ -1114,8 +1123,8 @@ def content():
 
     # ---------------- Acknowledgment & references ----------------
     BODY.append(para("Heading5", "Acknowledgment"))
-    P("The authors thank the School of Computer Science and Engineering, Vellore Institute of Technology, "
-      "Vellore, for the facilities and support provided for this work.")
+    P("We are grateful to the School of Computer Science and Engineering at Vellore Institute of Technology, "
+      "Vellore, for the computing resources and guidance that made this project possible.")
     BODY.append(para("Heading5", "References"))
 
 
