@@ -1,21 +1,32 @@
 # ==============================================================================
-# RetroC - Final Professor Demonstration Script
+# RetroC - Live demonstration script (matches the pitch deck, slides "Live demo")
 # ==============================================================================
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File demo\prof_demo.ps1
 #   powershell -ExecutionPolicy Bypass -File demo\prof_demo.ps1 -Auto
+#   powershell -ExecutionPolicy Bypass -File demo\prof_demo.ps1 -Bench
+# -Auto  : no pauses between steps
+# -Bench : also run the live W1-10k benchmark at the end (about 50 s)
 # ==============================================================================
 
 param(
-    [switch]$Auto = $false
+    [switch]$Auto = $false,
+    [switch]$Bench = $false
 )
 
 $ErrorActionPreference = "Stop"
+Set-Location (Join-Path $PSScriptRoot "..")
+
+# The MinGW build needs the MSYS2 UCRT64 runtime DLLs on PATH.
+$Msys = "C:\msys64\ucrt64\bin"
+if ((Test-Path $Msys) -and ($env:PATH -notlike "*$Msys*")) {
+    $env:PATH = "$Msys;$env:PATH"
+}
 
 function Step-Pause {
     if (-not $Auto) {
         Write-Host ""
-        Write-Host "Press [Enter] to continue to next demonstration step..." -ForegroundColor DarkGray
+        Write-Host "Press [Enter] for the next step..." -ForegroundColor DarkGray
         [void][System.Console]::ReadLine()
     } else {
         Start-Sleep -Milliseconds 800
@@ -25,150 +36,96 @@ function Step-Pause {
 function Print-Banner($title) {
     Write-Host ""
     Write-Host "======================================================================" -ForegroundColor Cyan
-    Write-Host "  $title" -ForegroundColor Yellow -NoNewline
-    Write-Host ""
+    Write-Host "  $title" -ForegroundColor Yellow
     Write-Host "======================================================================" -ForegroundColor Cyan
 }
 
-function Print-Section($sec, $desc) {
-    Write-Host ""
-    Write-Host "[$sec] " -ForegroundColor Green -NoNewline
-    Write-Host "$desc" -ForegroundColor White
+function Print-Note($text) {
+    Write-Host "Watch for: " -ForegroundColor Magenta -NoNewline
+    Write-Host $text -ForegroundColor Gray
 }
 
-# Locate binary
-$Retroc = "build\retroc.exe"
-if (-not (Test-Path $Retroc)) {
-    $Retroc = "build\Debug\retroc.exe"
+function Run-Retroc {
+    Write-Host ""
+    Write-Host ("> retroc " + ($args -join " ")) -ForegroundColor Cyan
+    & $Retroc @args
+    if ($LASTEXITCODE -ne 0) {
+        throw "retroc exited with code $LASTEXITCODE"
+    }
 }
+
+$Retroc = "build\retroc.exe"
+if (-not (Test-Path $Retroc)) { $Retroc = "build\Debug\retroc.exe" }
 if (-not (Test-Path $Retroc)) {
-    Write-Host "Error: retroc binary not found. Please run: cmake --build build" -ForegroundColor Red
+    Write-Host "Error: retroc binary not found. Build first: cmake --build build" -ForegroundColor Red
     exit 1
 }
 
 Clear-Host
-Print-Banner "RETROC: COMPILER FOR RETROACTIVELY EDITABLE DATAFLOW PIPELINES"
-Write-Host "Candidate: Sudeep | Project: Advanced Compiler & Incremental Runtime" -ForegroundColor DarkCyan
-Write-Host "Core Thesis: Making past input edits, stage insertions, and deletions" -ForegroundColor Gray
-Write-Host "             first-class compiler operations with fine-grained reuse." -ForegroundColor Gray
-
-Step-Pause
-
-# ------------------------------------------------------------------------------
-# STEP 1: Program Compilation & Retroactive IR
-# ------------------------------------------------------------------------------
-Print-Banner "STEP 1: BATCH PIPELINE & VERSIONED RETROACTIVE IR"
-Print-Section "1.1" "Sensor Log Pipeline Source ('demo/pipeline.rc')"
+Print-Banner "RETROC: A COMPILER FOR DATAFLOW PIPELINES WHOSE PAST YOU CAN EDIT"
+Write-Host "Swaraj Joshi, Johan Viji, Sudeep Kumar Sahu - CSE, VIT Vellore" -ForegroundColor DarkCyan
+Write-Host "Pipeline: demo\pipeline.rc (average of valid sensor readings)" -ForegroundColor Gray
 Get-Content "demo\pipeline.rc" | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
 
-Print-Section "1.2" "Initial Compilation & Canonical IR Dump ('retroc dump-ir')"
-Write-Host "Command: $Retroc dump-ir demo\pipeline.rc --verbose" -ForegroundColor Cyan
-& $Retroc dump-ir demo\pipeline.rc --verbose
+Step-Pause
 
-Print-Section "1.3" "Initial Batch Execution ('retroc run')"
-Write-Host "Command: $Retroc run demo\pipeline.rc" -ForegroundColor Cyan
-& $Retroc run demo\pipeline.rc
-
-Write-Host "Key Concept:" -ForegroundColor Magenta -NoNewline
-Write-Host " The IR nodes record topological dependencies, versions (I4), content hashes, and per-record memo tables." -ForegroundColor Gray
+# ------------------------------------------------------------------------------
+Print-Banner "STEP 1: COMPILE AND RUN"
+Run-Retroc dump-ir demo\pipeline.rc
+Run-Retroc run demo\pipeline.rc
+Print-Note "one IR node per stage; the first result is the average of the 4 valid readings."
 
 Step-Pause
 
 # ------------------------------------------------------------------------------
-# STEP 2: Retroactive Edit A (Modify Input) with Early Cutoff
-# ------------------------------------------------------------------------------
-Print-Banner "STEP 2: EDIT A - IN-PLACE RECORD MODIFICATION & EARLY CUTOFF"
-Write-Host "Scenario: Reading #102 was corrupted (-999.0 C, marked invalid)." -ForegroundColor White
-Write-Host "Edit #1: Manually set temperature to 22.0 C while still invalid." -ForegroundColor White
-Write-Host "Edit #2: Mark reading #102 as valid." -ForegroundColor White
-
-Print-Section "2.1" "Applying Edits & Generating Rebuild Plan"
-Write-Host "Command: $Retroc edit demo\pipeline.rc demo\edits.rcs" -ForegroundColor Cyan
-& $Retroc edit demo\pipeline.rc demo\edits.rcs
-
-Write-Host "Key Concept:" -ForegroundColor Magenta -NoNewline
-Write-Host " Notice Edit #1 achieves 80% REUSE with EARLY CUTOFF: downstream stages" -ForegroundColor Gray
-Write-Host "             were NOT even scheduled because the record remained filtered out!" -ForegroundColor Gray
+Print-Banner "STEP 2: FOUR RETROACTIVE EDITS"
+Get-Content "demo\edits.rcs" | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
+Run-Retroc edit demo\pipeline.rc demo\edits.rcs
+Print-Note "Edit #1 runs only the filter (1 of 5 ops) and changes no output: early cutoff."
+Print-Note "Edit #2 sends one record through; Edits #3-#4 insert, then delete, a stage."
 
 Step-Pause
 
 # ------------------------------------------------------------------------------
-# STEP 3: Retroactive Edit B & C - Structural Stage Insertion & Deletion
-# ------------------------------------------------------------------------------
-Print-Banner "STEP 3: EDITS B & C - STRUCTURAL STAGE INSERTION & DELETION"
-Write-Host "Scenario: Inserted 'calibrated' stage (+0.5 C offset) before 'temp_f'." -ForegroundColor White
-Write-Host "          Then deleted 'calibrated' stage to demonstrate dependency bypass." -ForegroundColor White
-Write-Host "Under the hood:" -ForegroundColor Gray
-Write-Host "  - Kahn's algorithm dynamically recomputes DAG topological order (I1)." -ForegroundColor DarkGray
-Write-Host "  - Atomic rollback snapshot guarantees state safety against cycles (I7)." -ForegroundColor DarkGray
-Write-Host "  - Downstream consumers rewired directly to predecessor on deletion." -ForegroundColor DarkGray
-
-Step-Pause
-
-# ------------------------------------------------------------------------------
-# STEP 4: Stretch Feature - O(log N) Incremental Tree Reduce
-# ------------------------------------------------------------------------------
-Print-Banner "STEP 4: STRETCH GOAL - O(log N) INCREMENTAL TREE REDUCTION"
-Print-Section "4.1" "Tree Reduce Source ('demo/tree_demo.rc')"
+Print-Banner "STEP 3: tree_reduce UPDATES ONE PATH TO THE ROOT"
 Get-Content "demo\tree_demo.rc" | ForEach-Object { Write-Host "  $_" -ForegroundColor DarkGray }
-
-Print-Section "4.2" "Modifying Record 3 in 8-Element Tree ('demo/tree_demo.rcs')"
-Write-Host "Command: $Retroc edit demo\tree_demo.rc demo\tree_demo.rcs" -ForegroundColor Cyan
-& $Retroc edit demo\tree_demo.rc demo\tree_demo.rcs
-
-Write-Host "Key Concept:" -ForegroundColor Magenta -NoNewline
-Write-Host " Standard reduce would recompute 5 elements linearly. Tree reduction" -ForegroundColor Gray
-Write-Host "             ascends the complete binary reduction tree in ceil(log2(N)) = 3 steps!" -ForegroundColor Gray
+Run-Retroc edit demo\tree_demo.rc demo\tree_demo.rcs
+Print-Note "changing 1 of 8 values evaluates 3 of 8 combines (log2 8 = 3)."
 
 Step-Pause
 
 # ------------------------------------------------------------------------------
-# STEP 5: Verification & Correctness
-# ------------------------------------------------------------------------------
-Print-Banner "STEP 5: VERIFICATION - EQUIVALENCE AGAINST FULL FROM-SCRATCH RERUN"
-Print-Section "5.1" "Automated Equivalence Verifier ('retroc verify')"
-Write-Host "Command: $Retroc verify demo\pipeline.rc demo\edits.rcs" -ForegroundColor Cyan
-& $Retroc verify demo\pipeline.rc demo\edits.rcs
-
-Print-Section "5.2" "Differential Testing Fuzzer (1,000 Randomized Trials)"
-Write-Host "Differential tester ('difftest') verifies edit-then-propagate equals" -ForegroundColor Gray
-Write-Host "full from-scratch rerun on rewritten source across 1,000 randomized fuzzing trials:" -ForegroundColor Gray
-Write-Host "  Result: 1,000 / 1,000 passed (100.00% equivalence, zero mismatches)." -ForegroundColor Green
+Print-Banner "STEP 4: VERIFY AGAINST A FULL RERUN"
+Run-Retroc verify demo\pipeline.rc demo\edits.rcs
+Print-Note "the edited source is rewritten and run from scratch; the outputs must match exactly."
 
 Step-Pause
 
 # ------------------------------------------------------------------------------
-# STEP 6: Causal Provenance Tracking ('explain')
-# ------------------------------------------------------------------------------
-Print-Banner "STEP 6: PROVENANCE TRACKING - EXPLAINING WHY OUTPUTS CHANGED"
-Print-Section "6.1" "Tracing Causal Edit Chain for 'avg_temp_f'"
-Write-Host "Command: $Retroc explain demo\pipeline.rc demo\edits.rcs avg_temp_f" -ForegroundColor Cyan
-& $Retroc explain demo\pipeline.rc demo\edits.rcs avg_temp_f
-
-Write-Host "Key Concept:" -ForegroundColor Magenta -NoNewline
-Write-Host " Edit #1 is omitted from the provenance chain because early cutoff" -ForegroundColor Gray
-Write-Host "             prevented it from affecting the final value of 'avg_temp_f'!" -ForegroundColor Gray
-
-Step-Pause
+Print-Banner "STEP 5: EXPLAIN WHY AN OUTPUT CHANGED"
+Run-Retroc explain demo\pipeline.rc demo\edits.rcs avg_temp_f
+Print-Note "Edit #1 is not listed: early cutoff showed it had no effect on avg_temp_f."
 
 # ------------------------------------------------------------------------------
-# STEP 7: Empirical Benchmark Evaluation
-# ------------------------------------------------------------------------------
-Print-Banner "STEP 7: EMPIRICAL BENCHMARKS (MEASURED HONEST NUMBERS)"
-Write-Host "Measured on 100k and 10k record pipelines across Baselines B0, B1, and B2:" -ForegroundColor White
-Write-Host ""
-Write-Host "  Workload                   Scenario              B0 (Rerun)   B1 (Coarse)   B2 (RetroC)   Speedup" -ForegroundColor Yellow
-Write-Host "  ---------------------------------------------------------------------------------------------" -ForegroundColor DarkGray
-Write-Host "  W1 (Synthetic ETL)         Modify 1 in 100k        37.1 ms      37.4 ms       3.4 ms       10.9x" -ForegroundColor Green
-Write-Host "  W2 (Branching Aggregation) Insert near end (10k)    3.5 ms       2.5 ms       1.2 ms        2.9x (81% reuse)" -ForegroundColor Green
-Write-Host "  W3 (Two-Table Join)        Modify 1 left key (10k) 18.2 ms      18.0 ms      12.5 ms        1.5x" -ForegroundColor Green
-Write-Host "  W4 (Deep Linear 7-Stage)   Modify head row (10k)    8.8 ms       8.9 ms       2.9 ms        3.0x" -ForegroundColor Green
-Write-Host ""
-Write-Host "  First-run memo overhead:   < 1.15x (plain 32 ms vs memoized 37 ms on 100k rows)" -ForegroundColor White
-Write-Host "  Full Test Suite:           100% passed (8 / 8 test suites, 46 unit test cases)" -ForegroundColor White
+$RunBench = $Bench
+if (-not $Bench -and -not $Auto) {
+    Write-Host ""
+    $answer = Read-Host "Run the live 10k-record benchmark now? It takes about 50 s [y/N]"
+    $RunBench = ($answer -eq "y" -or $answer -eq "Y")
+}
+if ($RunBench) {
+    Print-Banner "OPTIONAL: LIVE BENCHMARK, W1 WITH 10,000 RECORDS"
+    if (-not (Test-Path "bench\data\w1_10000.rc")) {
+        Write-Host "bench\data is missing; generate it first with build\gen_workload.exe" -ForegroundColor Red
+    } else {
+        $Out = Join-Path $env:TEMP "retroc_demo_bench"
+        & "build\bench_runner.exe" bench\data $Out --only W1-10k --cpu 2
+        Print-Note "B0/B2 is the speedup over a full rerun; Verify must say PASS on every row."
+    }
+}
 
 Write-Host ""
 Write-Host "======================================================================" -ForegroundColor Cyan
-Write-Host "  DEMONSTRATION COMPLETE - ALL GOALS & DELIVERABLES FULFILLED" -ForegroundColor Yellow
+Write-Host "  DEMO COMPLETE" -ForegroundColor Yellow
 Write-Host "======================================================================" -ForegroundColor Cyan
 Write-Host ""

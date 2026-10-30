@@ -44,6 +44,7 @@ private:
 
     // Collect all referenced stage names in an ExprIR tree
     void collect_stage_dependencies(const ExprIR* expr, std::vector<std::string>& stages_out) const;
+    void append_reference_inputs(Node& node) const;
 };
 
 } // namespace retroc

@@ -24,18 +24,21 @@ struct Graph {
         return nullptr;
     }
 
+    // An OUTPUT node carries the name of the stage it prints. Edits name
+    // stages (EDIT_SEMANTICS section 1), so the stage wins; without this the
+    // answer would depend on unordered_map iteration order.
     const Node* find_node_by_name(const std::string& name) const {
+        const Node* output = nullptr;
         for (const auto& [id, n] : nodes) {
-            if (n.name == name) return &n;
+            if (n.name != name) continue;
+            if (n.kind != NodeKind::OUTPUT) return &n;
+            output = &n;
         }
-        return nullptr;
+        return output;
     }
 
     Node* find_node_by_name(const std::string& name) {
-        for (auto& [id, n] : nodes) {
-            if (n.name == name) return &n;
-        }
-        return nullptr;
+        return const_cast<Node*>(static_cast<const Graph*>(this)->find_node_by_name(name));
     }
 
     // Assert graph invariants (I1: DAG and topological order, I2: unique NodeIds)

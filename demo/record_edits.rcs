@@ -1,0 +1,5 @@
+// Edit #1 (Insert record): a late reading from sensor 106 arrives
+retro insert into sensor_readings : { id: 106, temp_c: 23.9, valid: true }
+
+// Edit #2 (Delete record): reading 103 came from a faulty sensor and is removed
+retro delete sensor_readings[2]

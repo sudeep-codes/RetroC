@@ -1,4 +1,5 @@
 #include "verify/verifier.hpp"
+#include <algorithm>
 #include "edit/source_rewrite.hpp"
 #include "reuse/propagator.hpp"
 #include "bytecode/bytecode.hpp"
@@ -13,6 +14,19 @@
 #include <filesystem>
 
 namespace retroc {
+
+namespace {
+
+// Position of a record in its (RecordId-sorted) input collection, which is
+// also its position in the source array literal: deletes keep the relative
+// order and inserts append.
+size_t record_position(const Collection& col, RecordId id) {
+    auto it = std::lower_bound(col.begin(), col.end(), id,
+                               [](const CollectionItem& item, RecordId r) { return item.id < r; });
+    return static_cast<size_t>(it - col.begin());
+}
+
+} // namespace
 
 namespace {
 
@@ -106,10 +120,49 @@ VerificationResult verify_edits(const std::string& original_source,
             if (inp_node && !inp_node->from_file.empty()) {
                 // Input comes from CSV file: will save at the end of edit application
             } else {
-                auto rewrite_res = apply_modify_to_source(current_source, mod_edit);
+                // After record deletes, RecordIds are no longer positions in the
+                // source literal: rewrite the element at the record's position.
+                ModifyEdit positioned = mod_edit;
+                if (inp_node) {
+                    positioned.record_id = static_cast<RecordId>(
+                        record_position(executor.get_result(inp_node->id).collection_val, mod_edit.record_id));
+                }
+                auto rewrite_res = apply_modify_to_source(current_source, positioned);
                 if (std::holds_alternative<CompileError>(rewrite_res)) {
                     result.ok = false;
                     result.mismatch_details = "Source rewrite failed: " + std::get<CompileError>(rewrite_res).format();
+                    return result;
+                }
+                current_source = std::get<std::string>(rewrite_res);
+            }
+        } else if (edit_ptr->kind() == EditKind::INSERT_RECORD ||
+                   edit_ptr->kind() == EditKind::DELETE_RECORD) {
+            // Phase 12.3. A CSV input is written back to its file at the end;
+            // an inline input has its array literal rewritten.
+            bool is_insert = edit_ptr->kind() == EditKind::INSERT_RECORD;
+            const std::string& input_name = is_insert
+                ? static_cast<const InsertRecordEdit&>(*edit_ptr).input_stage
+                : static_cast<const DeleteRecordEdit&>(*edit_ptr).input_stage;
+            const auto* inp_node = graph.find_node_by_name(input_name);
+            size_t position = 0;
+            if (!is_insert && inp_node && inp_node->kind == NodeKind::INPUT) {
+                position = record_position(executor.get_result(inp_node->id).collection_val,
+                                           static_cast<const DeleteRecordEdit&>(*edit_ptr).record_id);
+            }
+            auto plan_res = propagator.apply_edit(*edit_ptr);
+            if (std::holds_alternative<CompileError>(plan_res)) {
+                result.ok = false;
+                result.mismatch_details = "Record edit failed: " + std::get<CompileError>(plan_res).format();
+                return result;
+            }
+            if (inp_node && inp_node->from_file.empty()) {
+                auto rewrite_res = is_insert
+                    ? apply_insert_record_to_source(current_source, static_cast<const InsertRecordEdit&>(*edit_ptr))
+                    : apply_delete_record_to_source(current_source, input_name, position, edit_ptr->loc);
+                if (std::holds_alternative<CompileError>(rewrite_res)) {
+                    result.ok = false;
+                    result.mismatch_details = "Source rewrite for record edit failed: " +
+                                              std::get<CompileError>(rewrite_res).format();
                     return result;
                 }
                 current_source = std::get<std::string>(rewrite_res);

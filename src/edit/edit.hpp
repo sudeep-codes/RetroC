@@ -12,7 +12,9 @@ namespace retroc {
 enum class EditKind {
     MODIFY,
     INSERT,
-    DELETE
+    DELETE,
+    INSERT_RECORD,
+    DELETE_RECORD
 };
 
 struct Edit {
@@ -71,6 +73,32 @@ struct DeleteEdit : public Edit {
 
     std::string to_string() const override {
         return "retro delete " + stage_name;
+    }
+};
+
+// Phase 12.3: retro insert into <input> : <literal>
+// The new record gets a fresh RecordId (larger than any used before in the
+// input) and is appended at the end.
+struct InsertRecordEdit : public Edit {
+    std::string input_stage;
+    std::string raw_literal_text; // e.g. "{ id: 7, v: 1.5, ok: true }"
+
+    EditKind kind() const override { return EditKind::INSERT_RECORD; }
+
+    std::string to_string() const override {
+        return "retro insert into " + input_stage + " : " + raw_literal_text;
+    }
+};
+
+// Phase 12.3: retro delete <input>[<RecordId>]
+struct DeleteRecordEdit : public Edit {
+    std::string input_stage;
+    RecordId record_id = 0;
+
+    EditKind kind() const override { return EditKind::DELETE_RECORD; }
+
+    std::string to_string() const override {
+        return "retro delete " + input_stage + "[" + std::to_string(record_id) + "]";
     }
 };
 

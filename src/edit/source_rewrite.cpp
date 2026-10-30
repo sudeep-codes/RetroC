@@ -321,4 +321,126 @@ std::variant<std::string, CompileError> apply_delete_to_source(const std::string
     return out.str();
 }
 
+namespace {
+
+// Byte offset of a token's first character
+size_t offset_of(const std::string& src, const SourceLocation& loc) {
+    size_t line = 1;
+    size_t i = 0;
+    while (i < src.size() && line < static_cast<size_t>(loc.line)) {
+        if (src[i] == '\n') line++;
+        i++;
+    }
+    return i + static_cast<size_t>(loc.col) - 1;
+}
+
+// Top-level elements of `input <name> ... = [ ... ]`: for each element the
+// index of its first token, plus the index of the closing ']'. Element ends
+// are taken from the next ',' or ']' token, because string tokens do not
+// carry their quotes.
+struct ArrayLayout {
+    std::vector<size_t> starts;  // first token of each element
+    std::vector<size_t> seps;    // ',' after each element, or the ']' for the last
+    size_t close = 0;            // ']'
+};
+
+std::variant<ArrayLayout, CompileError> find_input_array(const std::vector<Token>& tokens,
+                                                        const std::string& input_stage,
+                                                        const SourceLocation& loc) {
+    size_t i = 0;
+    while (i + 1 < tokens.size() && !(tokens[i].kind == TokenKind::KW_INPUT &&
+                                      tokens[i + 1].kind == TokenKind::IDENT &&
+                                      tokens[i + 1].text == input_stage)) {
+        i++;
+    }
+    if (i + 1 >= tokens.size()) {
+        return CompileError{ErrorCode::E601, loc, "source rewrite: input '" + input_stage + "' not found"};
+    }
+    while (i < tokens.size() && tokens[i].kind != TokenKind::EQUAL && tokens[i].kind != TokenKind::SEMICOLON) {
+        i++;
+    }
+    if (i >= tokens.size() || tokens[i].kind != TokenKind::EQUAL || i + 1 >= tokens.size() ||
+        tokens[i + 1].kind != TokenKind::LBRACKET) {
+        return CompileError{ErrorCode::E601, loc,
+                            "source rewrite: input '" + input_stage + "' has no inline array literal"};
+    }
+    ArrayLayout layout;
+    int depth = 0;
+    bool expect_start = true;
+    for (size_t k = i + 1; k < tokens.size(); ++k) {
+        TokenKind kind = tokens[k].kind;
+        if (kind == TokenKind::LBRACKET || kind == TokenKind::LBRACE || kind == TokenKind::LPAREN) {
+            depth++;
+            if (depth == 1) continue; // the array's own '['
+        } else if (kind == TokenKind::RBRACKET || kind == TokenKind::RBRACE || kind == TokenKind::RPAREN) {
+            depth--;
+            if (depth == 0) {
+                if (!expect_start) layout.seps.push_back(k);
+                layout.close = k;
+                return layout;
+            }
+        } else if (kind == TokenKind::COMMA && depth == 1) {
+            layout.seps.push_back(k);
+            expect_start = true;
+            continue;
+        }
+        if (expect_start && depth >= 1) {
+            layout.starts.push_back(k);
+            expect_start = false;
+        }
+    }
+    return CompileError{ErrorCode::E601, loc, "source rewrite: unterminated array literal"};
+}
+
+} // namespace
+
+std::variant<std::string, CompileError> apply_insert_record_to_source(const std::string& source_code,
+                                                                     const InsertRecordEdit& edit) {
+    Lexer lexer(source_code);
+    auto tok_res = lexer.tokenize();
+    if (std::holds_alternative<CompileError>(tok_res)) return std::get<CompileError>(tok_res);
+    const auto& tokens = std::get<std::vector<Token>>(tok_res);
+    auto layout_res = find_input_array(tokens, edit.input_stage, edit.loc);
+    if (std::holds_alternative<CompileError>(layout_res)) return std::get<CompileError>(layout_res);
+    const ArrayLayout& layout = std::get<ArrayLayout>(layout_res);
+
+    // Appended last, matching the fresh (largest) RecordId it gets at runtime
+    size_t at = offset_of(source_code, tokens[layout.close].loc);
+    std::string text = layout.starts.empty() ? edit.raw_literal_text : ", " + edit.raw_literal_text;
+    return source_code.substr(0, at) + text + source_code.substr(at);
+}
+
+std::variant<std::string, CompileError> apply_delete_record_to_source(const std::string& source_code,
+                                                                     const std::string& input_stage,
+                                                                     size_t position,
+                                                                     const SourceLocation& loc) {
+    Lexer lexer(source_code);
+    auto tok_res = lexer.tokenize();
+    if (std::holds_alternative<CompileError>(tok_res)) return std::get<CompileError>(tok_res);
+    const auto& tokens = std::get<std::vector<Token>>(tok_res);
+    auto layout_res = find_input_array(tokens, input_stage, loc);
+    if (std::holds_alternative<CompileError>(layout_res)) return std::get<CompileError>(layout_res);
+    const ArrayLayout& layout = std::get<ArrayLayout>(layout_res);
+    if (position >= layout.starts.size()) {
+        return CompileError{ErrorCode::E601, loc, "source rewrite: record position " + std::to_string(position) +
+                            " not found in '" + input_stage + "'"};
+    }
+    size_t from = 0;
+    size_t to = 0;
+    bool last = (position + 1 == layout.starts.size());
+    if (!last) {
+        // the element and the ',' after it
+        from = offset_of(source_code, tokens[layout.starts[position]].loc);
+        to = offset_of(source_code, tokens[layout.seps[position]].loc) + 1;
+    } else if (position > 0) {
+        // the ',' before the last element, and the element
+        from = offset_of(source_code, tokens[layout.seps[position - 1]].loc);
+        to = offset_of(source_code, tokens[layout.close].loc);
+    } else {
+        from = offset_of(source_code, tokens[layout.starts[0]].loc);
+        to = offset_of(source_code, tokens[layout.close].loc);
+    }
+    return source_code.substr(0, from) + source_code.substr(to);
+}
+
 } // namespace retroc

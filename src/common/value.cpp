@@ -107,6 +107,35 @@ uint64_t Value::hash() const {
     return h;
 }
 
+uint64_t Value::equality_hash() const {
+    switch (kind) {
+        case ValueKind::FLOAT:
+            if (float_val == 0.0) return Value::make_float(0.0).hash();
+            return hash();
+        case ValueKind::ARRAY: {
+            uint64_t h = hash_combine(14695981039346656037ULL, static_cast<uint64_t>(kind));
+            h = hash_combine(h, array_val.size());
+            for (const auto& elem : array_val) {
+                h = hash_combine(h, elem.equality_hash());
+            }
+            return h;
+        }
+        case ValueKind::RECORD: {
+            uint64_t h = hash_combine(14695981039346656037ULL, static_cast<uint64_t>(kind));
+            h = hash_combine(h, record_val.size());
+            for (const auto& f : record_val) {
+                h = hash_combine(h, hash_bytes(f.name.data(), f.name.size()));
+                if (f.value) {
+                    h = hash_combine(h, f.value->equality_hash());
+                }
+            }
+            return h;
+        }
+        default:
+            return hash();
+    }
+}
+
 std::string Value::to_string() const {
     switch (kind) {
         case ValueKind::INT:
@@ -149,14 +178,37 @@ std::string Value::to_string() const {
     return "";
 }
 
-uint64_t hash_collection(const Collection& col) {
+// splitmix64 finalizer: spreads bits so that summing mixed terms behaves like
+// a random 64-bit value per (RecordId, value) pair.
+static inline uint64_t mix64(uint64_t x) {
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+uint64_t collection_item_term(RecordId id, uint64_t value_hash) {
+    return mix64(mix64(id) ^ value_hash);
+}
+
+uint64_t collection_hash_from_sum(uint64_t term_sum, size_t size) {
     uint64_t h = 14695981039346656037ULL;
     h = hash_combine(h, static_cast<uint64_t>(ValueKind::ARRAY));
-    h = hash_combine(h, col.size());
-    for (const auto& item : col) {
-        h = hash_combine(h, item.value.hash());
-    }
+    h = hash_combine(h, size);
+    h = hash_combine(h, term_sum);
     return h;
+}
+
+uint64_t collection_term_sum(const Collection& col) {
+    uint64_t sum = 0;
+    for (const auto& item : col) {
+        sum += collection_item_term(item.id, item.value.hash());
+    }
+    return sum;
+}
+
+uint64_t hash_collection(const Collection& col) {
+    return collection_hash_from_sum(collection_term_sum(col), col.size());
 }
 
 } // namespace retroc

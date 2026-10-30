@@ -127,14 +127,15 @@ int main(int argc, char** argv) {
     generate_w1(out_dir, 100000);
     generate_w1(out_dir, 1000000);
 
-    // W2: 500 users, 2000 orders
+    // W2: 500 users, 2000 orders. BENCHMARKS.md asks for 50k/200k, but JOIN is a
+    // nested loop (O(users x orders)), so that size is not runnable.
     generate_w2(out_dir, 500, 2000);
 
     // W3: 100000 records, 12 chained stages
     generate_w3(out_dir, 100000);
 
-    // W4: 100000 records, reduce heavy
-    generate_w4(out_dir, 100000);
+    // W4: 1M records, reduce heavy (BENCHMARKS.md section 2)
+    generate_w4(out_dir, 1000000);
 
     std::cout << "Workload generation complete." << std::endl;
     return 0;

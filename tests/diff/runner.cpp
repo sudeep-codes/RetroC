@@ -212,7 +212,9 @@ static bool test_invalid_edit(size_t trial_idx, std::mt19937& rng,
 // runs verify_edits (propagated vs rerun from scratch), and validates equality.
 static bool run_trial(size_t trial_idx, uint32_t seed, std::mt19937& rng) {
     // Generate 1-2 inputs
-    size_t num_records = 5 + (rng() % 20); // 5 to 24 records
+    // 5 to 200 records: large enough that single-record edits take the
+    // propagator's in-place patch path, not only its full-scan path.
+    size_t num_records = 5 + (rng() % 196);
 
     std::uniform_real_distribution<double> val_dist(-10.0, 10.0);
     std::uniform_int_distribution<int> bool_dist(0, 1);
@@ -237,7 +239,17 @@ static bool run_trial(size_t trial_idx, uint32_t seed, std::mt19937& rng) {
     src << "];\n";
 
     // Random choice of pipeline structure
-    int pipeline_type = rng() % 3;
+    int pipeline_type = rng() % 7;
+    if (pipeline_type == 5) {
+        // Second input for the join template: one tag per row id
+        src << "input tags: [{ id: int, label: int }] = [\n";
+        for (size_t r = 0; r < num_records; ++r) {
+            src << "  { id: " << (r + 1) << ", label: " << int_dist(rng) << " }";
+            if (r + 1 < num_records) src << ",";
+            src << "\n";
+        }
+        src << "];\n";
+    }
     if (pipeline_type == 0) {
         // filter -> map -> reduce -> scalar -> output
         src << "let clean = filter(rows, r => r.ok);\n";
@@ -250,12 +262,61 @@ static bool run_trial(size_t trial_idx, uint32_t seed, std::mt19937& rng) {
         src << "let scaled = map(rows, r => { id: r.id, score: r.v * 2.0, ok: r.ok });\n";
         src << "let passed = filter(scaled, r => r.ok);\n";
         src << "let total = reduce(passed, 0.0, (acc, r) => acc + r.score);\n";
+        src << "let cnt = reduce(passed, 0, (acc, r) => acc + 1);\n";  // additive int sum
         src << "output total;\n";
-    } else {
+        src << "output cnt;\n";
+    } else if (pipeline_type == 2) {
         // filter -> map -> output
         src << "let clean = filter(rows, r => r.ok);\n";
         src << "let ids = map(clean, r => r.id * 10);\n";
         src << "output ids;\n";
+    } else if (pipeline_type == 3) {
+        // deep chain: two filters that flip records in and out, a collection
+        // output, and a scalar that reads a collection through length()
+        src << "let a = filter(rows, r => r.ok);\n";
+        src << "let b = map(a, r => { id: r.id, v: r.v * 2.0, ok: r.ok });\n";
+        src << "let c = filter(b, r => r.v > 0.0);\n";
+        src << "let d = map(c, r => { id: r.id, v: r.v + 1.0, ok: r.ok });\n";
+        src << "let n = length(d);\n";
+        src << "let t = reduce(d, 0.0, (acc, r) => acc + r.v);\n";
+        src << "let k = reduce(d, 5, (acc, r) => acc + r.id * 3);\n";  // additive int sum
+        src << "output d;\n";
+        src << "output k;\n";
+        src << "output t;\n";
+        src << "output n;\n";
+    } else if (pipeline_type == 4) {
+        // branching (a has two consumers) and an incremental tree_reduce
+        src << "let a = filter(rows, r => r.v > -5.0);\n";
+        src << "let w = map(a, r => r.id);\n";
+        src << "let s = tree_reduce(w, 0, (x, y) => x + y);\n";
+        src << "let hi = filter(a, r => r.ok);\n";
+        src << "let m = reduce(hi, 0.0, (acc, r) => acc + r.v);\n";
+        src << "let q = reduce(w, 7, (acc, x) => x * 2 + acc);\n";     // additive, term first
+        src << "let mx = reduce(w, 0, (acc, x) => if x > acc then x else acc);\n"; // not additive
+        src << "output s;\n";
+        src << "output q;\n";
+        src << "output mx;\n";
+        src << "output m;\n";
+        src << "output hi;\n";
+    } else if (pipeline_type == 6) {
+        // lambdas that read other stages by name (reference inputs, BUG-001):
+        // any change to tot or n must reach every record of shifted and big
+        src << "let clean = filter(rows, r => r.ok);\n";
+        src << "let tot = reduce(clean, 0.0, (a, r) => a + r.v);\n";
+        src << "let n = length(clean);\n";
+        src << "let shifted = map(rows, r => { id: r.id, v: r.v + tot, ok: r.ok });\n";
+        src << "let big = filter(shifted, r => r.v > tot / 2.0 or r.id < n);\n";
+        src << "let s2 = reduce(big, 0, (acc, r) => acc + r.id);\n";
+        src << "output shifted;\n";
+        src << "output s2;\n";
+    } else {
+        // join: record ids of the join output are renumbered on every change
+        src << "let okrows = filter(rows, r => r.ok);\n";
+        src << "let j = join(okrows, tags, r => r.id, t => t.id);\n";
+        src << "let lab = map(j, p => p.right.label);\n";
+        src << "let tot = reduce(lab, 0, (acc, x) => acc + x);\n";
+        src << "output tot;\n";
+        src << "output lab;\n";
     }
 
     std::string program_source = src.str();
@@ -275,9 +336,26 @@ static bool run_trial(size_t trial_idx, uint32_t seed, std::mt19937& rng) {
     } else if (pipeline_type == 1) {
         stages.push_back({"scaled", "row", "score_row", false}); // produces {id, score, ok}
         stages.push_back({"passed", "score_row", "score_row", false}); // total depends on passed
-    } else {
+    } else if (pipeline_type == 2) {
         stages.push_back({"clean", "row", "row", true});
         stages.push_back({"ids", "row", "int", false});
+    } else if (pipeline_type == 3) {
+        stages.push_back({"a", "row", "row", true});
+        stages.push_back({"b", "row", "row", true});
+        stages.push_back({"c", "row", "row", true});
+        stages.push_back({"d", "row", "row", false}); // source of output d
+    } else if (pipeline_type == 4) {
+        stages.push_back({"a", "row", "row", true});
+        stages.push_back({"w", "row", "int", false});  // feeds tree_reduce
+        stages.push_back({"hi", "row", "row", false}); // source of output hi
+    } else if (pipeline_type == 6) {
+        // clean is read by name (length), so it cannot be deleted
+        stages.push_back({"clean", "row", "row", false});
+        stages.push_back({"shifted", "row", "row", false}); // source of output shifted
+        stages.push_back({"big", "row", "row", true});
+    } else {
+        stages.push_back({"okrows", "row", "row", true});
+        stages.push_back({"j", "row", "joined", false});
     }
 
     // Generate 1 to 4 random edits (modify, insert, delete)
@@ -285,14 +363,41 @@ static bool run_trial(size_t trial_idx, uint32_t seed, std::mt19937& rng) {
     EditScript script;
     int gen_counter = 1;
 
-    for (size_t e = 0; e < num_edits; ++e) {
-        int edit_kind = rng() % 100; // 0..59: modify (60%), 60..79: insert (20%), 80..99: delete (20%)
+    // RecordIds alive in rows: record deletes leave gaps, inserts get fresh ids
+    std::vector<RecordId> live_ids;
+    for (size_t r = 0; r < num_records; ++r) live_ids.push_back(r);
+    RecordId next_id = num_records;
 
-        if (edit_kind < 60) {
+    for (size_t e = 0; e < num_edits; ++e) {
+        // 0..44 modify, 45..59 insert stage, 60..74 delete stage,
+        // 75..87 insert record, 88..99 delete record
+        int edit_kind = rng() % 100;
+
+        if (edit_kind >= 75) {
+            if (edit_kind < 88) {
+                auto ins = std::make_shared<InsertRecordEdit>();
+                ins->input_stage = "rows";
+                double v = static_cast<int>(val_dist(rng) * 10.0) / 10.0;
+                ins->raw_literal_text = "{ id: " + std::to_string(int_dist(rng)) + ", v: " + format_float(v) +
+                                        ", ok: " + (bool_dist(rng) ? "true" : "false") + " }";
+                live_ids.push_back(next_id++);
+                script.edits.push_back(ins);
+            } else if (live_ids.size() > 1) {
+                size_t k = rng() % live_ids.size();
+                auto del = std::make_shared<DeleteRecordEdit>();
+                del->input_stage = "rows";
+                del->record_id = live_ids[k];
+                live_ids.erase(live_ids.begin() + static_cast<long>(k));
+                script.edits.push_back(del);
+            }
+            continue;
+        }
+
+        if (edit_kind < 45) {
             // Modify input record
             auto mod = std::make_shared<ModifyEdit>();
             mod->input_stage = "rows";
-            mod->record_id = rng() % num_records;
+            mod->record_id = live_ids[rng() % live_ids.size()];
 
             int field_choice = rng() % 3;
             if (field_choice == 0) {
@@ -312,7 +417,7 @@ static bool run_trial(size_t trial_idx, uint32_t seed, std::mt19937& rng) {
                 mod->raw_literal_text = std::to_string(new_id);
             }
             script.edits.push_back(mod);
-        } else if (edit_kind < 80) {
+        } else if (edit_kind < 60) {
             // Insert stage before target_stage
             if (!stages.empty()) {
                 size_t target_idx = rng() % stages.size();
@@ -324,12 +429,21 @@ static bool run_trial(size_t trial_idx, uint32_t seed, std::mt19937& rng) {
                 ins->new_stage_name = new_name;
 
                 if (target_stage.in_elem_type == "row") {
-                    if (rng() % 2 == 0) {
+                    // Identity-like lambdas exercise early cutoff; the others
+                    // change values or drop records downstream.
+                    int lambda_choice = rng() % 4;
+                    if (lambda_choice == 0) {
                         ins->builtin_name = "filter";
                         ins->raw_lambda_text = "x => x.id >= 0";
-                    } else {
+                    } else if (lambda_choice == 1) {
                         ins->builtin_name = "map";
                         ins->raw_lambda_text = "x => { id: x.id + 1, v: x.v, ok: x.ok }";
+                    } else if (lambda_choice == 2) {
+                        ins->builtin_name = "filter";
+                        ins->raw_lambda_text = "x => x.v > 0.0";
+                    } else {
+                        ins->builtin_name = "map";
+                        ins->raw_lambda_text = "x => { id: x.id, v: x.v + 1.0, ok: x.ok }";
                     }
                     stages.insert(stages.begin() + target_idx, {new_name, "row", "row", true});
                 } else if (target_stage.in_elem_type == "score_row") {

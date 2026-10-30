@@ -6,6 +6,202 @@
 
 namespace retroc {
 
+static void scan_stage_refs(const ExprIR* expr, const std::vector<std::string>& params,
+                            StageRefMap& refs) {
+    if (!expr) return;
+    BytecodeCompiler compiler(params);
+    BytecodeProgram prog = compiler.compile(expr);
+    for (size_t i = 0; i < prog.code.size(); ++i) {
+        if (prog.code[i].op != Opcode::LOAD_STAGE) continue;
+        const std::string& name = prog.stage_names[prog.code[i].arg];
+        bool length_only = (i + 1 < prog.code.size() &&
+                            prog.code[i + 1].op == Opcode::BUILTIN_LENGTH_ARRAY);
+        auto& use = refs[name];
+        if (!length_only) {
+            use = StageRefUse::FULL;
+        } else if (use == StageRefUse::NONE) {
+            use = StageRefUse::LENGTH_ONLY;
+        }
+    }
+}
+
+StageRefMap analyze_stage_refs(const Graph& graph) {
+    StageRefMap refs;
+    for (const auto& [id, node] : graph.nodes) {
+        if (node.fn) scan_stage_refs(node.fn->body.get(), node.fn->params, refs);
+        if (node.join_fn_b) scan_stage_refs(node.join_fn_b->body.get(), node.join_fn_b->params, refs);
+        scan_stage_refs(node.init.get(), {}, refs);
+        scan_stage_refs(node.expr.get(), {}, refs);
+    }
+    return refs;
+}
+
+void store_stage_value(std::unordered_map<std::string, Value>& stage_values,
+                       const StageRefMap& refs, const std::string& name,
+                       const NodeExecutionResult& res) {
+    if (!res.is_collection) {
+        stage_values[name] = res.scalar_val;
+        return;
+    }
+    auto it = refs.find(name);
+    if (it == refs.end() || it->second == StageRefUse::NONE) {
+        return;
+    }
+    // LENGTH_ONLY: BUILTIN_LENGTH_ARRAY reads the size from int_val, so we
+    // avoid copying every record just to answer length(c).
+    stage_values[name] = (it->second == StageRefUse::FULL) ? res.as_value() : res.as_stage_value();
+}
+
+namespace {
+
+// Key of one input record: from the key index when its input hash and key
+// function are unchanged (I3), otherwise by running the key lambda.
+Value join_key(const BytecodeProgram& prog, const CollectionItem& item, uint64_t key_fn_hash,
+               std::unordered_map<RecordId, JoinKeyEntry>& index, const StageValues& stage_values,
+               bool use_memo, uint64_t gen, size_t& evals) {
+    uint64_t in_hash = item.value.hash();
+    if (use_memo) {
+        auto it = index.find(item.id);
+        if (it != index.end() && it->second.inHash == in_hash && it->second.keyFnHash == key_fn_hash) {
+            it->second.layoutGen = gen;
+            return it->second.key;
+        }
+    }
+    evals++;
+    Value key = VM::execute(prog, &item.value, 1, stage_values);
+    if (use_memo) {
+        index[item.id] = JoinKeyEntry{in_hash, key_fn_hash, key, gen};
+    }
+    return key;
+}
+
+} // namespace
+
+uint64_t compute_memo_key(const Node& node,
+                          const std::unordered_map<NodeId, NodeExecutionResult>& results) {
+    uint64_t key = node.fnHash;
+    for (size_t i = collection_arity(node.kind); i < node.inputs.size(); ++i) {
+        auto it = results.find(node.inputs[i]);
+        uint64_t h = (it == results.end()) ? 0 : it->second.hash();
+        key ^= h + 0x9e3779b97f4a7c15ULL + (key << 6) + (key >> 2);
+    }
+    return key;
+}
+
+size_t execute_join(Node& node, const Collection& left, const Collection& right,
+                    NodeExecutionResult& res, const StageValues& stage_values, bool use_memo) {
+    // Stages the key lambdas read by name are part of every key's memo key
+    uint64_t refs = node.memoKey ^ node.fnHash;
+    uint64_t ka_hash = (node.fn ? hash_lambda_ir(*node.fn) : 0) ^ refs;
+    uint64_t kb_hash = (node.join_fn_b ? hash_lambda_ir(*node.join_fn_b) : 0) ^ refs;
+    BytecodeCompiler ka_comp(node.fn->params);
+    auto ka_prog = ka_comp.compile(node.fn->body.get());
+    BytecodeCompiler kb_comp(node.join_fn_b->params);
+    auto kb_prog = kb_comp.compile(node.join_fn_b->body.get());
+
+    size_t evals = 0;
+    // Key entries stamped with this generation are the records of this layout
+    uint64_t gen = use_memo ? ++node.memo.join_layout_gen : 0;
+    std::vector<Value> right_keys;
+    right_keys.reserve(right.size());
+    // Buckets keep right order, so matches come out in right order per left record
+    std::unordered_map<uint64_t, std::vector<size_t>> buckets;
+    buckets.reserve(right.size());
+    for (size_t j = 0; j < right.size(); ++j) {
+        right_keys.push_back(join_key(kb_prog, right[j], kb_hash, node.memo.join_right_keys,
+                                      stage_values, use_memo, gen, evals));
+        buckets[right_keys.back().equality_hash()].push_back(j);
+    }
+
+    Collection out;
+    RecordId out_id = 0;
+    auto& memo = node.memo;
+    if (use_memo) {
+        memo.join_pairs.clear();
+        memo.join_left_pos.clear();
+        memo.join_right_pos.clear();
+    }
+    // Records the layout of the output record about to be appended
+    auto note_pair = [&](RecordId l, RecordId r) {
+        if (!use_memo) return;
+        memo.join_left_pos[l].push_back(memo.join_pairs.size());
+        memo.join_right_pos[r].push_back(memo.join_pairs.size());
+        memo.join_pairs.emplace_back(l, r);
+    };
+    for (const auto& l_item : left) {
+        Value l_key = join_key(ka_prog, l_item, ka_hash, node.memo.join_left_keys,
+                               stage_values, use_memo, gen, evals);
+        auto b = buckets.find(l_key.equality_hash());
+        if (b == buckets.end()) continue;
+        uint64_t l_hash = l_item.value.hash();
+        for (size_t j : b->second) {
+            if (!(l_key == right_keys[j])) continue; // hash collision
+            const CollectionItem& r_item = right[j];
+            uint64_t r_hash = r_item.value.hash();
+            JoinPairKey pair_key{l_item.id, r_item.id};
+            if (use_memo) {
+                auto m = node.memo.join_memo.find(pair_key);
+                if (m != node.memo.join_memo.end() && m->second.leftHash == l_hash &&
+                    m->second.rightHash == r_hash && m->second.kaHash == ka_hash &&
+                    m->second.kbHash == kb_hash) {
+                    note_pair(l_item.id, r_item.id);
+                    out.push_back(CollectionItem{out_id++, m->second.out});
+                    continue;
+                }
+            }
+            std::vector<RecordField> fields = {
+                {"left", std::make_shared<Value>(l_item.value)},
+                {"right", std::make_shared<Value>(r_item.value)}
+            };
+            Value record = Value::make_record(std::move(fields));
+            if (use_memo) {
+                // Only matched pairs are stored: unmatched pairs need no output
+                node.memo.join_memo[pair_key] = JoinMemoEntry{l_hash, r_hash, ka_hash, kb_hash, true, record};
+            }
+            note_pair(l_item.id, r_item.id);
+            out.push_back(CollectionItem{out_id++, std::move(record)});
+        }
+    }
+    memo.join_layout_valid = use_memo;
+    res.is_collection = true;
+    res.collection_val = std::move(out);
+    res.rehash_collection();
+    return evals;
+}
+
+size_t execute_additive_reduce(Node& node, const ExprIR* term, const Collection& in,
+                               NodeExecutionResult& res, const StageValues& stage_values,
+                               bool store_memo) {
+    BytecodeCompiler init_comp;
+    auto init_prog = init_comp.compile(node.init.get());
+    int64_t init = VM::execute(init_prog, {}, stage_values).int_val;
+    BytecodeCompiler term_comp(node.fn->params);
+    auto term_prog = term_comp.compile(term);
+
+    SumReduceMemo memo;
+    if (store_memo) memo.terms.reserve(in.size());
+    uint64_t sum = 0;
+    // The term never reads the accumulator, so its slot is a placeholder
+    Value args[2] = {Value::make_int(0), Value()};
+    for (const auto& item : in) {
+        args[1] = item.value;
+        int64_t t = VM::execute(term_prog, args, 2, stage_values).int_val;
+        sum += static_cast<uint64_t>(t); // wraparound, as int addition (LANGUAGE_SPEC)
+        if (store_memo) memo.terms.emplace_back(item.id, t);
+    }
+    res.is_collection = false;
+    res.scalar_val = Value::make_int(static_cast<int64_t>(static_cast<uint64_t>(init) + sum));
+    if (store_memo) {
+        memo.fnHash = node.memoKey;
+        memo.initHash = hash_expr_ir(node.init.get());
+        memo.init = init;
+        memo.sum = sum;
+        memo.valid = true;
+        node.memo.sum_memo = std::move(memo);
+    }
+    return in.size();
+}
+
 size_t GraphExecutor::total_memo_bytes() const {
     size_t total = 0;
     for (const auto& [id, node] : graph_.nodes) {
@@ -22,6 +218,7 @@ void GraphExecutor::run(std::ostream* output_stream) {
     HistoryEntry entry;
     entry.edit_id = 0; // 0 represents initial run
     entry.description = "initial run";
+    stage_refs_ = analyze_stage_refs(graph_);
 
     // Invariant I1: graph_.order is a valid topological order
     for (const auto& node_id : graph_.order) {
@@ -72,6 +269,7 @@ std::vector<std::pair<std::string, Value>> GraphExecutor::get_output_values() co
 void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
     NodeExecutionResult res;
     entry.nodes_touched.push_back(node.name);
+    node.memoKey = compute_memo_key(node, results_);
 
     if (!enable_memo_) {
         node.memo.clear();
@@ -132,7 +330,7 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
                         auto memo_it = node.memo.map_memo.find(item.id);
                         if (memo_it != node.memo.map_memo.end() &&
                             memo_it->second.inHash == in_hash &&
-                            memo_it->second.fnHash == node.fnHash) {
+                            memo_it->second.fnHash == node.memoKey) {
                             // Reused
                             entry.ops_reused += 1;
                             res.collection_val.push_back(CollectionItem{item.id, memo_it->second.out});
@@ -144,7 +342,7 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
                     entry.ops_recomputed += 1;
                     Value out_val = VM::execute(prog, {item.value}, stage_values_);
                     if (enable_memo_) {
-                        node.memo.map_memo[item.id] = MapMemoEntry{in_hash, node.fnHash, out_val};
+                        node.memo.map_memo[item.id] = MapMemoEntry{in_hash, node.memoKey, out_val};
                     }
                     res.collection_val.push_back(CollectionItem{item.id, std::move(out_val)});
                 }
@@ -167,7 +365,7 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
                         auto memo_it = node.memo.filter_memo.find(item.id);
                         if (memo_it != node.memo.filter_memo.end() &&
                             memo_it->second.inHash == in_hash &&
-                            memo_it->second.fnHash == node.fnHash) {
+                            memo_it->second.fnHash == node.memoKey) {
                             entry.ops_reused += 1;
                             keep = memo_it->second.keep;
                             if (keep) {
@@ -182,7 +380,7 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
                     Value keep_val = VM::execute(prog, {item.value}, stage_values_);
                     keep = keep_val.bool_val;
                     if (enable_memo_) {
-                        node.memo.filter_memo[item.id] = FilterMemoEntry{in_hash, node.fnHash, keep};
+                        node.memo.filter_memo[item.id] = FilterMemoEntry{in_hash, node.memoKey, keep};
                     }
                     if (keep) {
                         res.collection_val.push_back(item);
@@ -197,16 +395,24 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
             const auto& input_res = results_[node.inputs[0]];
             res.is_collection = false;
 
-            uint64_t input_hash = input_res.as_value().hash();
+            uint64_t input_hash = input_res.hash();
             uint64_t init_hash = node.init ? hash_expr_ir(node.init.get()) : 0;
 
             // Invariant I3: check memo for REDUCE
             if (enable_memo_ && node.memo.reduce_memo.valid &&
                 node.memo.reduce_memo.inputHash == input_hash &&
-                node.memo.reduce_memo.fnHash == node.fnHash &&
+                node.memo.reduce_memo.fnHash == node.memoKey &&
                 node.memo.reduce_memo.initHash == init_hash) {
                 entry.ops_reused += input_res.collection_val.size();
                 res.scalar_val = node.memo.reduce_memo.result;
+            } else if (const ExprIR* term = additive_reduce_term(node)) {
+                // Phase 12.2: record per-record terms so edits can patch the sum
+                entry.ops_recomputed += execute_additive_reduce(node, term, input_res.collection_val,
+                                                                res, stage_values_, enable_memo_);
+                if (enable_memo_) {
+                    node.memo.reduce_memo = ReduceMemoEntry{input_hash, node.memoKey, init_hash,
+                                                            res.scalar_val, true};
+                }
             } else {
                 // Evaluate init expr
                 BytecodeCompiler init_comp;
@@ -223,7 +429,7 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
                 }
                 res.scalar_val = acc;
                 if (enable_memo_) {
-                    node.memo.reduce_memo = ReduceMemoEntry{input_hash, node.fnHash, init_hash, acc, true};
+                    node.memo.reduce_memo = ReduceMemoEntry{input_hash, node.memoKey, init_hash, acc, true};
                 }
             }
             break;
@@ -233,12 +439,12 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
             const auto& input_res = results_[node.inputs[0]];
             res.is_collection = false;
 
-            uint64_t input_hash = input_res.as_value().hash();
+            uint64_t input_hash = input_res.hash();
             uint64_t init_hash = node.init ? hash_expr_ir(node.init.get()) : 0;
 
             if (enable_memo_ && node.memo.tree_reduce_memo.valid &&
                 node.memo.tree_reduce_memo.inputHash == input_hash &&
-                node.memo.tree_reduce_memo.fnHash == node.fnHash &&
+                node.memo.tree_reduce_memo.fnHash == node.memoKey &&
                 node.memo.tree_reduce_memo.initHash == init_hash) {
                 entry.ops_reused += node.memo.tree_reduce_memo.num_leaves > 0 ? (node.memo.tree_reduce_memo.num_leaves - 1) : 1;
                 res.scalar_val = node.memo.tree_reduce_memo.result;
@@ -257,7 +463,7 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
                 if (enable_memo_) {
                     TreeReduceMemo memo;
                     memo.inputHash = input_hash;
-                    memo.fnHash = node.fnHash;
+                    memo.fnHash = node.memoKey;
                     memo.initHash = init_hash;
                     memo.result = init_val;
                     memo.valid = true;
@@ -281,7 +487,7 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
                     memo.leaf_offset = 1;
                     memo.num_leaves = 1;
                     memo.inputHash = input_hash;
-                    memo.fnHash = node.fnHash;
+                    memo.fnHash = node.memoKey;
                     memo.initHash = init_hash;
                     memo.result = out;
                     memo.valid = true;
@@ -327,7 +533,7 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
             res.scalar_val = memo.tree[1];
             if (enable_memo_) {
                 memo.inputHash = input_hash;
-                memo.fnHash = node.fnHash;
+                memo.fnHash = node.memoKey;
                 memo.initHash = init_hash;
                 memo.result = memo.tree[1];
                 memo.valid = true;
@@ -342,67 +548,8 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
             // Record fields: { left: A, right: B }
             const auto& left_res = results_[node.inputs[0]];
             const auto& right_res = results_[node.inputs[1]];
-            res.is_collection = true;
-
-            uint64_t ka_hash = node.fn ? hash_lambda_ir(*node.fn) : 0;
-            uint64_t kb_hash = node.join_fn_b ? hash_lambda_ir(*node.join_fn_b) : 0;
-
-            BytecodeCompiler ka_comp(node.fn->params);
-            auto ka_prog = ka_comp.compile(node.fn->body.get());
-
-            BytecodeCompiler kb_comp(node.join_fn_b->params);
-            auto kb_prog = kb_comp.compile(node.join_fn_b->body.get());
-
-            // Build index on right side keys
-            std::vector<std::pair<Value, const CollectionItem*>> right_keys;
-            right_keys.reserve(right_res.collection_val.size());
-            for (const auto& r_item : right_res.collection_val) {
-                Value key = VM::execute(kb_prog, {r_item.value}, stage_values_);
-                entry.ops_recomputed += 1;
-                right_keys.push_back({std::move(key), &r_item});
-            }
-
-            RecordId out_id = 0;
-            for (const auto& l_item : left_res.collection_val) {
-                Value l_key = VM::execute(ka_prog, {l_item.value}, stage_values_);
-                entry.ops_recomputed += 1;
-                uint64_t l_hash = l_item.value.hash();
-
-                for (const auto& [r_key, r_item_ptr] : right_keys) {
-                    JoinPairKey pair_key{l_item.id, r_item_ptr->id};
-                    uint64_t r_hash = r_item_ptr->value.hash();
-
-                    if (enable_memo_) {
-                        auto memo_it = node.memo.join_memo.find(pair_key);
-                        if (memo_it != node.memo.join_memo.end() &&
-                            memo_it->second.leftHash == l_hash &&
-                            memo_it->second.rightHash == r_hash &&
-                            memo_it->second.kaHash == ka_hash &&
-                            memo_it->second.kbHash == kb_hash) {
-                            if (memo_it->second.matched) {
-                                res.collection_val.push_back(CollectionItem{out_id++, memo_it->second.out});
-                            }
-                            continue;
-                        }
-                    }
-
-                    bool matched = (l_key == r_key);
-                    Value out_record;
-                    if (matched) {
-                        std::vector<RecordField> fields = {
-                            {"left", std::make_shared<Value>(l_item.value)},
-                            {"right", std::make_shared<Value>(r_item_ptr->value)}
-                        };
-                        out_record = Value::make_record(std::move(fields));
-                        res.collection_val.push_back(CollectionItem{out_id++, out_record});
-                    }
-                    if (enable_memo_) {
-                        node.memo.join_memo[pair_key] = JoinMemoEntry{
-                            l_hash, r_hash, ka_hash, kb_hash, matched, std::move(out_record)
-                        };
-                    }
-                }
-            }
+            entry.ops_recomputed += execute_join(node, left_res.collection_val, right_res.collection_val,
+                                                 res, stage_values_, enable_memo_);
             break;
         }
 
@@ -411,13 +558,13 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
             // Compute combined hash of input stage values
             uint64_t inputs_hash = 14695981039346656037ULL;
             for (const auto& in_id : node.inputs) {
-                inputs_hash ^= results_[in_id].as_value().hash();
+                inputs_hash ^= results_[in_id].hash();
                 inputs_hash *= 1099511628211ULL;
             }
 
             if (enable_memo_ && node.memo.scalar_memo.valid &&
                 node.memo.scalar_memo.inputsHash == inputs_hash &&
-                node.memo.scalar_memo.fnHash == node.fnHash) {
+                node.memo.scalar_memo.fnHash == node.memoKey) {
                 entry.ops_reused += 1;
                 res.scalar_val = node.memo.scalar_memo.result;
             } else {
@@ -426,7 +573,7 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
                 auto prog = comp.compile(node.expr.get());
                 res.scalar_val = VM::execute(prog, {}, stage_values_);
                 if (enable_memo_) {
-                    node.memo.scalar_memo = ScalarMemoEntry{inputs_hash, node.fnHash, res.scalar_val, true};
+                    node.memo.scalar_memo = ScalarMemoEntry{inputs_hash, node.memoKey, res.scalar_val, true};
                 }
             }
             break;
@@ -443,8 +590,12 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
         }
     }
 
+    if (res.is_collection) {
+        res.rehash_collection();
+    }
+
     // Invariant I4: version increases iff outHash changes
-    uint64_t new_out_hash = res.as_value().hash();
+    uint64_t new_out_hash = res.hash();
     if (new_out_hash != node.outHash || node.version == 0) {
         node.version += 1;
         node.outHash = new_out_hash;
@@ -452,8 +603,11 @@ void GraphExecutor::execute_node(Node& node, HistoryEntry& entry) {
     // Invariant I5: after execution/propagation, status is CLEAN
     node.status = NodeStatus::CLEAN;
 
-    // Save stage value for downstream stages that refer to this stage by name
-    stage_values_[node.name] = res.as_value();
+    // Save stage value for downstream stages that refer to this stage by name.
+    // OUTPUT nodes share their source stage's name and value, so skip them.
+    if (node.kind != NodeKind::OUTPUT) {
+        store_stage_value(stage_values_, stage_refs_, node.name, res);
+    }
     results_[node.id] = std::move(res);
 }
 

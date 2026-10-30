@@ -1,117 +1,93 @@
-# RetroC: Professor Demonstration Walkthrough & Oral Script
+# RetroC: Pitch and Live Demo Walkthrough
 
-This guide is designed for presenting the final **RetroC** demonstration to your professor or project evaluation panel. It contains the exact commands to run, what to say for each screen, and answers to technical questions.
+This is the run sheet for presenting RetroC with the pitch deck. The full word-for-word script for every slide is in the deck's speaker notes; this file is the plan, the demo commands and the Q&A.
+
+All numbers below come from `bench/published/2026-10-28/` and the test run of 2026-10-28 (see `MEMORY.md`). Do not quote older numbers (10.9×, 1,000 trials, 1.15× overhead): they are out of date.
 
 ---
 
-## 1. Quick Launch
+## 1. Before the session (10 minutes)
 
-Open Windows Terminal or PowerShell in the repository root and run:
+1. Build: `cmake --build build` (with `C:\msys64\ucrt64\bin` on PATH).
+2. Dry run once: `powershell -ExecutionPolicy Bypass -File demo\prof_demo.ps1 -Auto`.
+3. Terminal: font size 18+ and a dark theme. Put the terminal and slides on separate windows and switch with Alt+Tab.
+4. Record a backup video of the demo (Win+Alt+R). If the live demo fails, use the "recorded output" slide or the video.
+5. Close other heavy apps if you plan to run the live benchmark.
 
-```cmd
-demo\prof_demo.bat
-```
-*(Alternatively, run in interactive step-by-step mode via PowerShell:)*
+---
+
+## 2. Running order (about 14 minutes)
+
+| Part | Slides | Time | Suggested speaker |
+|---|---|---|---|
+| Problem and idea | 1-4: cover, problem, existing tools, our idea | 2.5 min | Swaraj |
+| How it works | 5-10: language, flow, IR, edit propagation, record-level reuse, hash and tree_reduce | 4.5 min | Johan |
+| Live demo | 11 (12 is the backup) | 4 min | Sudeep |
+| Results | 13-16: setup, headline, wins and losses, correctness | 2.5 min | Swaraj |
+| Close | 17-19: contributions, limitations, questions | 1 min | Johan |
+
+Change the speakers to suit your team; the point is that each person owns one block.
+
+---
+
+## 3. The live demo
+
+Switch to the terminal on slide 11 and run:
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File demo\prof_demo.ps1
 ```
-*Note: Press `[Enter]` after each step to advance to the next section.*
+
+Press Enter between steps. Optional flags: `-Auto` (no pauses), `-Bench` (run the live benchmark without asking).
+
+| Step | Command | What to point at |
+|---|---|---|
+| 1 | `retroc dump-ir` then `retroc run demo\pipeline.rc` | One IR node per stage. First result: `avg_temp_f = 73.17` |
+| 2 | `retroc edit demo\pipeline.rc demo\edits.rcs` | Edit #1: only the filter runs, `1 / 5`, `Reuse: 80.0%`, `Updated outputs: (none)`: early cutoff. Edit #2: one record goes through the map; the plain `reduce` re-adds all 5. Edits #3 and #4 insert and delete a stage. |
+| 3 | `retroc edit demo\tree_demo.rc demo\tree_demo.rcs` | `tree_reduce`: `evaluated 3 / 8`: one path to the root. |
+| 4 | `retroc verify demo\pipeline.rc demo\edits.rcs` | `Verification OK: all outputs match full rerun exactly.` |
+| 5 | `retroc explain ... avg_temp_f` | Edit #1 is not listed, because early cutoff proved it had no effect. |
+| 6 (optional) | `bench_runner --only W1-10k` (about 50 s) | B0/B2 for "modify 1 record" is about 9.6×. Every row says PASS. |
+
+If something fails, don't debug it live: go to slide 12 (the recorded output) and carry on.
 
 ---
 
-## 2. Step-by-Step Presentation Script
+## 4. Numbers you may quote
 
-### Introduction (15-Second Elevator Pitch)
-> **What to Say:**  
-> *"Good morning, Professor. Today I am presenting RetroC. In modern data science and ETL engineering, modifying a historical input record or inserting a normalization step in the middle of a pipeline usually forces a full, expensive recomputation from scratch.  
-> RetroC is an optimizing compiler and runtime for a pure dataflow language that makes retroactive history edits—modifying inputs, inserting stages, and deleting stages—first-class compiler operations. By combining a versioned dataflow IR, record-level memoization, early cutoff, and tree-based reduction, RetroC achieves up to a 10.9× speedup over full reruns with 100% verified correctness."*
-
----
-
-### Step 1: Batch Pipeline & The Retroactive IR
-> **On Screen:** Shows `demo/pipeline.rc`, the IR dump (`retroc dump-ir`), and initial execution.  
-> **What to Say:**  
-> *"Here is a realistic sensor-log processing pipeline in RetroC's pure dataflow language. We filter valid readings, convert Celsius to Fahrenheit, and compute the average temperature.  
-> When compiled, RetroC lowers the program into a versioned Directed Acyclic Graph (the Retroactive IR). Every node tracks its topological dependencies, a monotonically increasing version number (Invariant I4), content hashes, and per-record memo tables. Initial execution produces an initial average temperature of 73.17°F."*
-
----
-
-### Step 2: Edit A (Modify Input) & Fine-Grained Early Cutoff
-> **On Screen:** Shows `retroc edit` with Edit #1 and Edit #2.  
-> **What to Say:**  
-> *"Now we apply two retroactive edits to past records:  
-> In Edit #1, reading #102 was corrupt (-999.0°C and marked invalid). We edit its temperature to 22.0°C. Notice RetroC generates a structured Rebuild Plan: only 1 out of 5 records is evaluated, achieving **80% reuse**. Furthermore, because reading #102 is still marked invalid by the filter, RetroC applies **early cutoff**: downstream stages (`temp_f`, `sum_f`, `avg_temp_f`) are not even scheduled, saving all subsequent computations!  
-> In Edit #2, we mark reading #102 as valid. Now the record passes the filter, and downstream stages update dynamically with minimal recomputation."*
+| Claim | Value | Source |
+|---|---|---|
+| One-record edit, W1 100k | 9.87× faster than a rerun (521 ms → 53 ms) | full protocol, B0/B2 |
+| One-record edit, W1 1M | 10.05× (5.47 s → 0.54 s) | full protocol |
+| One-record edit, W3 (12 stages) | 22.39× | full protocol |
+| Before / after removing the rescan | 1.28× → 9.87× (W1 100k) | paper Fig. 6 |
+| Losses | batches 0.03-0.23×, W2 joins 0.02-0.40×, insert near start 0.71-1.06× | full protocol |
+| vs. stage-level invalidation (B1) | 8.8-20× on one-record edits for W1 and W3; structural edits 0.64-0.98× of B1 | full protocol |
+| First run with memo tables | +42.7% | W1 100k |
+| Memo memory | 36.18 MB for 1.73 MB of input | W1 100k |
+| Tests | 52 cases, 687 assertions, 8/8 suites, 10,000 differential trials, planted bug caught at trial 16 | 2026-10-28 run |
 
 ---
 
-### Step 3: Edits B & C (Structural Stage Insertion & Deletion)
-> **On Screen:** Shows Edit #3 (Insert `calibrated` stage) and Edit #4 (Delete `calibrated` stage).  
-> **What to Say:**  
-> *"Unlike streaming systems that only handle append deltas, RetroC supports structural graph edits on the live pipeline.  
-> In Edit #3, we insert a bias-correction stage called `calibrated` in the middle of the pipeline. RetroC uses Kahn’s algorithm to dynamically recompute the DAG topological sort while protecting against cycles using an atomic rollback snapshot (Invariant I7).  
-> In Edit #4, we delete the `calibrated` stage. RetroC automatically splices the graph, rewiring downstream dependencies directly to the predecessor stage."*
+## 5. Likely questions
 
----
+**How is this different from Differential Dataflow?**
+Differential Dataflow propagates record changes through a fixed dataflow graph. RetroC also inserts and deletes stages in the graph, as type-checked atomic edits, and checks every result against a full rerun. We have not yet benchmarked against it directly; that is listed as future work.
 
-### Step 4: Stretch Feature — $O(\log N)$ Incremental Tree Reduce
-> **On Screen:** Shows `demo/tree_demo.rc` and modifying one number in an 8-element tree.  
-> **What to Say:**  
-> *"Standard fold (`reduce`) is strictly $O(N)$ because an early modification invalidates the accumulator chain.  
-> As a Phase 12 stretch goal, I implemented `tree_reduce` for associative combiners. RetroC builds a 1-indexed binary reduction tree. When record 3 is modified from 40 to 90, RetroC updates the leaf and ascends to the root in $\lceil \log_2(8) \rceil = 3$ operations. For 1,024 elements, RetroC executes exactly 10 combiner operations instead of 1,024, verified by our unit test suite."*
+**Why are batches slower than a rerun?**
+Each edit in a batch is propagated on its own, so 100 edits do 100 passes. Propagating a batch in one pass, plus a cost model that falls back to a rerun, is the first next step.
 
----
+**Why are joins slow?**
+A changed key forces matching pairs to be recomputed, and our join has no incremental index yet. An incremental hash join is future work.
 
-### Step 5: Verification & Correctness Guarantee
-> **On Screen:** Shows `retroc verify demo/pipeline.rc demo/edits.rcs` returning `Verification OK`.  
-> **What to Say:**  
-> *"The core correctness theorem of RetroC is that the output of incremental propagation must equal a byte-identical from-scratch rerun of the edited program text:  
-> $$\text{Propagate}(P, E) \equiv \text{Run}(\text{Rewrite}(P, E))$$  
-> Our built-in verifier parses the rewritten source text, re-executes it from a clean slate, and performs structural value equality checks. In addition, our automated differential testing fuzzer (`difftest`) ran **1,000 randomized fuzzing trials** with zero mismatches (100% equivalence)."*
+**What is the memory overhead?**
+High: 36.18 MB of memo tables for 1.73 MB of input, because every stage keeps the input hash and output of every record. The first run is 42.7% slower because it fills them. Compacting the memo is future work.
 
----
+**How do you stop an insert from creating a cycle?**
+After an insert, the graph is re-sorted with Kahn's algorithm. If not every node can be ordered, there is a cycle; the edit is rejected with a coded error and fully rolled back.
 
-### Step 6: Provenance Tracking (`retroc explain`)
-> **On Screen:** Shows `retroc explain demo/pipeline.rc demo/edits.rcs avg_temp_f`.  
-> **What to Say:**  
-> *"RetroC provides full explainability. Running `retroc explain` displays the exact causal history of why an output changed.  
-> Notice that Edit #1 (modifying the temperature while still invalid) is automatically excluded from the provenance chain. Because early cutoff absorbed it, RetroC correctly deduces that Edit #1 had no causal impact on the final output."*
+**Why is early cutoff safe?**
+Lambdas are pure: no mutation, I/O, randomness or recursion. So the same input always gives the same output, and if a stage's output hash is unchanged, everything after it would compute the same values. Hash collisions are bounded by q²/2⁶⁵ after q hashes.
 
----
-
-### Step 7: Empirical Benchmarks & Conclusion
-> **On Screen:** Displays measured benchmark numbers across W1–W4.  
-> **What to Say:**  
-> *"Finally, we evaluated RetroC against full reruns (Baseline B0) and coarse stage-level invalidation (Baseline B1):  
-> - On a 100,000-record ETL pipeline (W1), RetroC achieves a **10.9× speedup** (3.4 ms vs 37.1 ms).  
-> - On late stage insertions (W2), RetroC reuses **81.3%** of all pipeline operations.  
-> - The initial cold-run memoization overhead is only **1.15×**, far below our 2.5× budget.  
-> All 8 test suites are passing with zero warnings under C++17 and CMake. Thank you, and I welcome any questions."*
-
----
-
-## 3. Anticipated Professor Questions & Technical Answers
-
-### Q1: "How does RetroC differ from Differential Dataflow (Frank McSherry et al.)?"
-> **Answer:**  
-> *"Differential Dataflow is designed for forward-moving streaming collections where inputs are appended or deleted using multiversion timestamps over a static dataflow graph.  
-> RetroC addresses a different problem: the pipeline's *own developmental history* is retroactive. RetroC allows developers to insert and delete intermediate transformation stages in the middle of an existing DAG and reorders topological execution on the fly, which static streaming engines cannot do without reconstructing the pipeline."*
-
-### Q2: "What is the memory overhead of your per-record memo tables?"
-> **Answer:**  
-> *"Each record memo entry stores only a 64-bit input hash, a 64-bit function hash, and the output `Value` pointer. In our empirical measurements on 100,000 rows (Workload W1), total memo table memory remained under 4.8 MB, representing approximately 1.4× the raw dataset size. This easily satisfies our PRD requirement of remaining under 5× memory overhead."*
-
-### Q3: "How do you guarantee that dynamic stage insertion does not introduce cycles?"
-> **Answer:**  
-> *"When a user issues `retro insert before target as new_stage`, RetroC clones the graph and executes Kahn's topological sort algorithm (`Graph::recompute_topological_order()`). If the vertex count of the topological order is less than $|V|$, a cycle has occurred. Invariant I7 dictates atomic rollback: the compiler aborts, returns compile error `E601`, and restores the previous execution snapshot with zero side effects."*
-
-### Q4: "How does early cutoff maintain soundness?"
-> **Answer:**  
-> *"Because RetroC enforces strict language purity (no side effects, no mutation, no recursion), any stage's output is a pure mathematical function of its inputs and lambda definition. If a set of modified records produces output hashes identical to their prior versions, the collection's combined hash is invariant. By induction, downstream nodes would compute identical results. Skipping them is therefore mathematically sound."*
-
-### Q5: "What are the limitations of RetroC?"
-> **Answer:**  
-> *"As noted in section 9 of our report:  
-> 1. RetroC executes in-process in single-node memory.  
-> 2. For non-associative aggregations, reduce is $O(N)$.  
-> 3. If an edit modifies $>60\%$ of records simultaneously, work-set tracking overhead can approach raw recomputation; a cost model to switch to full stage invalidation would be a natural next step."*
+**Are there known bugs?**
+Yes, one: a lambda that reads another stage (for example `map(xs, x => x + total)`) is not refreshed when `total` changes. Fixing it needs a change to the IR specification, which we have proposed.

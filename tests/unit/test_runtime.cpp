@@ -256,8 +256,12 @@ output total;
     // Check memo sizes
     const auto* joined_node = g.find_node_by_name("joined");
     REQUIRE(joined_node != nullptr);
-    CHECK(joined_node->memo.join_memo.size() == 6); // 2 users * 3 orders
-    CHECK(joined_node->memo.size() == 6);
+    // Hash join: pair memo holds only the 3 matched pairs; the key index holds
+    // one key per input record (2 users + 3 orders)
+    CHECK(joined_node->memo.join_memo.size() == 3);
+    CHECK(joined_node->memo.join_left_keys.size() == 2);
+    CHECK(joined_node->memo.join_right_keys.size() == 3);
+    CHECK(joined_node->memo.size() == 8);
     CHECK(joined_node->version == 1);
     CHECK(joined_node->outHash != 0);
 
@@ -270,7 +274,9 @@ output total;
     const auto* reduce_node = g.find_node_by_name("total");
     REQUIRE(reduce_node != nullptr);
     CHECK(reduce_node->memo.reduce_memo.valid == true);
-    CHECK(reduce_node->memo.size() == 1);
+    // (a, x) => a + x over ints is additive: one stored term per record
+    CHECK(reduce_node->memo.sum_memo.valid == true);
+    CHECK(reduce_node->memo.size() == 3);
     CHECK(reduce_node->version == 1);
 
     // Check memory accounting

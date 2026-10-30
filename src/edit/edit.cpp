@@ -202,6 +202,36 @@ std::variant<EditScript, CompileError> EditScriptParser::parse() {
             edit->raw_literal_text = lit_text;
             script.edits.push_back(std::move(edit));
         } else if (match_ident("insert")) {
+            // retro insert into <input> : <literal>   (Phase 12.3)
+            if (match_ident("into")) {
+                if (peek().kind != TokenKind::IDENT) {
+                    return CompileError{ErrorCode::E201, SourceLocation{line_num, peek().loc.col + static_cast<int>(pos)},
+                                        "expected input stage name after 'retro insert into', found '" + peek().text + "'"};
+                }
+                std::string input_stage = peek().text;
+                t++;
+                if (peek().kind != TokenKind::COLON) {
+                    return CompileError{ErrorCode::E201, SourceLocation{line_num, peek().loc.col + static_cast<int>(pos)},
+                                        "expected ':' before the record literal, found '" + peek().text + "'"};
+                }
+                t++;
+                if (peek().kind == TokenKind::END_OF_FILE) {
+                    return CompileError{ErrorCode::E201, SourceLocation{line_num, peek().loc.col + static_cast<int>(pos)},
+                                        "expected a literal after ':'"};
+                }
+                // Keep the literal's source text (string tokens drop their quotes);
+                // it is type-checked against the input when the edit is applied.
+                std::string literal = line_content.substr(static_cast<size_t>(peek().loc.col - 1));
+                while (!literal.empty() && std::isspace(static_cast<unsigned char>(literal.back()))) {
+                    literal.pop_back();
+                }
+                auto rec_edit = std::make_shared<InsertRecordEdit>();
+                rec_edit->loc = line_loc;
+                rec_edit->input_stage = input_stage;
+                rec_edit->raw_literal_text = literal;
+                script.edits.push_back(std::move(rec_edit));
+                continue;
+            }
             // retro insert before <stage> [as <name>] : map(_, <lambda>)
             // or: filter(_, <lambda>)
             if (!match_ident("before")) {
@@ -306,6 +336,38 @@ std::variant<EditScript, CompileError> EditScriptParser::parse() {
             }
             std::string stage_name = peek().text;
             t++;
+
+            // retro delete <input>[<RecordId>]   (Phase 12.3)
+            if (peek().kind == TokenKind::LBRACKET) {
+                t++;
+                if (peek().kind != TokenKind::INT_LIT) {
+                    return CompileError{ErrorCode::E201, SourceLocation{line_num, peek().loc.col + static_cast<int>(pos)},
+                                        "expected integer RecordId inside '[]', found '" + peek().text + "'"};
+                }
+                RecordId record_id = 0;
+                try {
+                    record_id = static_cast<RecordId>(std::stoull(peek().text));
+                } catch (...) {
+                    return CompileError{ErrorCode::E601, SourceLocation{line_num, peek().loc.col + static_cast<int>(pos)},
+                                        "invalid RecordId integer literal '" + peek().text + "'"};
+                }
+                t++;
+                if (peek().kind != TokenKind::RBRACKET) {
+                    return CompileError{ErrorCode::E201, SourceLocation{line_num, peek().loc.col + static_cast<int>(pos)},
+                                        "expected ']' after RecordId, found '" + peek().text + "'"};
+                }
+                t++;
+                if (peek().kind != TokenKind::END_OF_FILE) {
+                    return CompileError{ErrorCode::E201, SourceLocation{line_num, peek().loc.col + static_cast<int>(pos)},
+                                        "unexpected token after 'retro delete <input>[<RecordId>]': '" + peek().text + "'"};
+                }
+                auto rec_edit = std::make_shared<DeleteRecordEdit>();
+                rec_edit->loc = line_loc;
+                rec_edit->input_stage = stage_name;
+                rec_edit->record_id = record_id;
+                script.edits.push_back(std::move(rec_edit));
+                continue;
+            }
 
             if (peek().kind != TokenKind::END_OF_FILE) {
                 return CompileError{ErrorCode::E201, SourceLocation{line_num, peek().loc.col + static_cast<int>(pos)},

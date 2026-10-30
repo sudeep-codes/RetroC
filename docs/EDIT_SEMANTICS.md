@@ -6,6 +6,8 @@ One edit per line, `//` comments allowed. Stage names refer to stages in the cur
 retro modify  <input>[<RecordId>].<field> = <literal>
 retro insert  before <stage> : map(_, <lambda>)        // or filter(_, <lambda>)
 retro delete  <stage>
+retro insert  into <input> : <literal>               // add an input record (Phase 12.3)
+retro delete  <input>[<RecordId>]                    // remove an input record (Phase 12.3)
 ```
 - `_` denotes the first input of `<stage>` (the collection the new stage will read).
 - Inserted stages are named `<stage>$ins<k>` unless `as <name>` is given: `retro insert before scaled as clamped : map(_, r => ...)`.
@@ -39,6 +41,16 @@ Rewrite:
 3. Recompute topological order.
 4. Seed work set: `{(C, r) for each consumer C, each record r}`; each consumer reuses memo entries whose input hash is unchanged (early cutoff).
 Deleting a stage that is the only source of an OUTPUT is an error (E601).
+Deleting a stage that another expression reads by name (a reference input, IR_SPEC section 2) is an error (E601): the name would no longer resolve.
+
+## 5a. Edits D and E — insert / delete an input record (Phase 12.3)
+Precondition (insert): `<input>` is an INPUT stage; `<literal>` has the input's element type (checked like source code; failure is E601).
+Precondition (delete): `<input>` is an INPUT stage and RecordId exists in it.
+Rewrite:
+1. Insert: the record gets a fresh RecordId, larger than every RecordId the input has ever held, and is appended at the end. Delete: the record is removed. RecordIds are never reused, so later edits that name `<input>[<RecordId>]` keep meaning the same record.
+2. The input's outHash and version change (I4).
+3. Seed work set: `{(consumer, RecordId)}` for each consumer, exactly as for a modify; a removed record is dropped from downstream collections and memo-based sums.
+Source rewrite (for the verifier): an inline input's array literal gains the literal as its last element, or loses the element at the record's position (its index in the RecordId-sorted collection). A CSV input is written back to its file. A rerun renumbers records by position; collection order, and therefore every output, is unchanged.
 
 ## 6. Propagation algorithm (shared)
 ```
@@ -51,9 +63,12 @@ propagate(workSet):
           key = (hash(in[r]), node.fnHash)
           if memo[r].matches(key): reuse           # I3
           else: evaluate fn, store in memo[r], count as recomputed
-      JOIN:   re-evaluate keys for pending records; recompute only affected key groups
+      JOIN:   re-evaluate keys only for records whose input hash changed (key index);
+              rebuild the output by hash join, reusing matched-pair memo entries
       REDUCE: if input hash unchanged and fnHash/initHash unchanged: reuse
-              else recompute fold (O(n) in v1)
+              else if additive int fold and patching k changed records is cheaper
+                   than n (cost model: k * (cost + lookup) < n * cost): swap their terms
+              else recompute fold (O(n))
       SCALAR: reuse if inputsHash+fnHash unchanged, else evaluate
     newOutHash = hash(output)
     if newOutHash == node.outHash:  EARLY CUTOFF: mark downstream nodes UNKNOWN->CLEAN, no work
@@ -61,6 +76,8 @@ propagate(workSet):
     node.status = CLEAN
 ```
 Records dropped or added by FILTER appear as removed/new entries in the downstream collection; downstream memo entries for removed RecordIds are garbage-collected after propagation.
+
+A node that reads a changed stage by name (a reference input, not an iterated collection) gets a full scan: every record may depend on that stage, and its memo key changed (IR_SPEC I3).
 
 ## 7. Rebuild plan (output of each edit)
 Counted in "operations" = lambda/expression evaluations (a REDUCE counts one per element folded).

@@ -1,3 +1,13 @@
+// Benchmark runner for docs/BENCHMARKS.md.
+//
+// Protocol: 3 warm-up runs, then median of 11 timed runs, min and max reported.
+// A system whose single run takes longer than kSlowRunMs drops to 1 warm-up +
+// kSlowRuns timed runs; the table marks those rows with the run count so the
+// deviation is visible. Timing excludes parsing, compiling, data loading and
+// graph cloning (setup happens outside the timed region).
+//
+// Usage: bench_runner [data_dir] [results_dir] [--machine "CPU, RAM, OS"] [--only W1]
+//                     [--cpu N]  pin to logical CPU N (hybrid CPUs: pick a performance core)
 #include "edit/edit.hpp"
 #include "edit/source_rewrite.hpp"
 #include "ir/builder.hpp"
@@ -11,38 +21,99 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 namespace fs = std::filesystem;
 using namespace retroc;
+
+static constexpr int kWarmup = 3;
+static constexpr int kRuns = 11;
+static constexpr double kSlowRunMs = 10000.0;
+static constexpr int kSlowRuns = 5;
 
 struct TimingStats {
   double median_ms = 0.0;
   double min_ms = 0.0;
   double max_ms = 0.0;
+  int runs = 0;
+  bool skipped = false;
 };
 
-TimingStats compute_stats(std::vector<double> &times) {
-  if (times.empty())
-    return {0.0, 0.0, 0.0};
-  std::sort(times.begin(), times.end());
+static TimingStats compute_stats(std::vector<double> times) {
   TimingStats stats;
+  if (times.empty())
+    return stats;
+  std::sort(times.begin(), times.end());
   stats.min_ms = times.front();
   stats.max_ms = times.back();
   size_t mid = times.size() / 2;
-  if (times.size() % 2 == 0) {
-    stats.median_ms = (times[mid - 1] + times[mid]) / 2.0;
-  } else {
-    stats.median_ms = times[mid];
-  }
+  stats.median_ms = (times.size() % 2 == 0) ? (times[mid - 1] + times[mid]) / 2.0
+                                            : times[mid];
+  stats.runs = static_cast<int>(times.size());
   return stats;
 }
 
-std::variant<std::pair<Graph, TypedProgram>, CompileError>
+// run_once performs its own setup and returns only the timed portion in ms.
+static TimingStats measure_one(const std::function<double()> &run_once) {
+  double first = run_once();
+  int warmups = kWarmup;
+  int runs = kRuns;
+  if (first > kSlowRunMs) {
+    warmups = 1;
+    runs = kSlowRuns;
+  }
+  for (int i = 1; i < warmups; ++i)
+    run_once();
+  std::vector<double> times;
+  for (int i = 0; i < runs; ++i)
+    times.push_back(run_once());
+  return compute_stats(std::move(times));
+}
+
+// Measures several systems round-robin (one run of each per round) so slow
+// drift such as thermal throttling affects all of them alike and the speedup
+// ratios stay comparable. Each system gets its own run count from its first
+// warm-up, as in measure().
+static std::vector<TimingStats>
+measure_interleaved(const std::vector<std::function<double()>> &systems) {
+  size_t k = systems.size();
+  std::vector<int> warmups(k, kWarmup), runs(k, kRuns);
+  for (size_t s = 0; s < k; ++s) {
+    if (systems[s]() > kSlowRunMs) {
+      warmups[s] = 1;
+      runs[s] = kSlowRuns;
+    }
+  }
+  for (int i = 1; i < kWarmup; ++i)
+    for (size_t s = 0; s < k; ++s)
+      if (i < warmups[s])
+        systems[s]();
+  std::vector<std::vector<double>> times(k);
+  for (int i = 0; i < kRuns; ++i)
+    for (size_t s = 0; s < k; ++s)
+      if (i < runs[s])
+        times[s].push_back(systems[s]());
+  std::vector<TimingStats> stats;
+  for (auto &t : times)
+    stats.push_back(compute_stats(std::move(t)));
+  return stats;
+}
+
+static double elapsed_ms(std::chrono::high_resolution_clock::time_point t0) {
+  auto t1 = std::chrono::high_resolution_clock::now();
+  return std::chrono::duration<double, std::milli>(t1 - t0).count();
+}
+
+static std::variant<std::pair<Graph, TypedProgram>, CompileError>
 build_ast_and_ir(const std::string &src) {
   Lexer lexer(src);
   auto lex_res = lexer.tokenize();
@@ -65,7 +136,16 @@ build_ast_and_ir(const std::string &src) {
   return std::make_pair(std::move(g), std::move(typed_prog));
 }
 
-std::string read_file(const std::string &path) {
+static Graph build_graph(const std::string &src) {
+  auto res = build_ast_and_ir(src);
+  if (std::holds_alternative<CompileError>(res)) {
+    std::cerr << "compile error: " << std::get<CompileError>(res).message << "\n";
+    std::exit(1);
+  }
+  return std::move(std::get<std::pair<Graph, TypedProgram>>(res).first);
+}
+
+static std::string read_file(const std::string &path) {
   std::ifstream f(path);
   if (!f.is_open())
     return "";
@@ -74,498 +154,532 @@ std::string read_file(const std::string &path) {
   return ss.str();
 }
 
+struct Scenario {
+  std::string workload; // e.g. "W1-100k"
+  std::string rc_file;
+  std::string edit;     // E-A .. E-F
+  std::string detail;   // human-readable description of the edit
+  EditScript script;
+  bool skip_b1 = false; // estimated to take far too long; reported as skipped
+};
+
 struct BenchResultRow {
   std::string workload;
   std::string edit;
-  double b0_ms = 0.0;
-  double b1_ms = 0.0;
-  double b2_ms = 0.0;
-  double speedup_b0_b2 = 0.0;
-  double speedup_b1_b2 = 0.0;
+  std::string detail;
+  TimingStats b0, b1, b2;
   double reuse_pct = 0.0;
-  bool verify_ok = false;
   size_t ops_evaluated = 0;
   size_t ops_reused = 0;
+  size_t full_rerun_ops = 0;
+  bool verify_ok = false;
 };
 
 struct OverheadRow {
   std::string workload;
-  double first_run_plain_ms = 0.0;
-  double first_run_history_ms = 0.0;
+  TimingStats plain;
+  TimingStats history;
   double overhead_pct = 0.0;
   double memo_mb = 0.0;
   double input_mb = 0.0;
 };
 
-void run_first_run_overhead(const std::string &source_path,
-                            const std::string &source_dir, OverheadRow &row) {
-  std::string src = read_file(source_path);
-  if (src.empty()) {
-    std::cerr << "Failed to read " << source_path << std::endl;
-    return;
+// Applies every edit; when totals is given, sums op counts over the script.
+static void apply_all(Propagator &prop, const EditScript &script, RebuildPlan *totals) {
+  if (totals)
+    *totals = RebuildPlan{};
+  for (const auto &ed : script.edits) {
+    std::variant<RebuildPlan, CompileError> pres;
+    if (ed->kind() == EditKind::MODIFY)
+      pres = prop.apply_modify(static_cast<const ModifyEdit &>(*ed));
+    else if (ed->kind() == EditKind::INSERT)
+      pres = prop.apply_insert(static_cast<const InsertEdit &>(*ed));
+    else
+      pres = prop.apply_delete(static_cast<const DeleteEdit &>(*ed));
+    if (std::holds_alternative<CompileError>(pres)) {
+      std::cerr << "edit rejected: " << std::get<CompileError>(pres).message << "\n";
+      std::exit(2);
+    }
+    if (totals) {
+      const auto &plan = std::get<RebuildPlan>(pres);
+      totals->recomputed_ops += plan.recomputed_ops;
+      totals->reused_ops += plan.reused_ops;
+      totals->full_rerun_ops += plan.full_rerun_ops;
+    }
+  }
+}
+
+// Source text of the edited program, used for the B0 full rerun. Modify edits
+// on CSV inputs are applied by editing the cached CSV collection instead.
+static std::string edited_source(const std::string &original_source,
+                                 const std::string &source_dir,
+                                 const EditScript &script,
+                                 std::vector<const ModifyEdit *> &csv_modifies) {
+  std::string current = original_source;
+  Graph graph = build_graph(original_source);
+  GraphExecutor ex(graph, source_dir, true);
+  ex.run();
+  Propagator prop(graph, ex);
+  for (const auto &ed : script.edits) {
+    if (ed->kind() == EditKind::MODIFY) {
+      const auto &me = static_cast<const ModifyEdit &>(*ed);
+      const auto *in_n = graph.find_node_by_name(me.input_stage);
+      if (in_n && !in_n->from_file.empty()) {
+        csv_modifies.push_back(&me);
+      } else {
+        current = std::get<std::string>(apply_modify_to_source(current, me));
+      }
+    } else if (ed->kind() == EditKind::INSERT) {
+      const auto &ie = static_cast<const InsertEdit &>(*ed);
+      prop.apply_insert(ie);
+      current = std::get<std::string>(apply_insert_to_source(current, ie, ie.new_stage_name));
+    } else {
+      const auto &de = static_cast<const DeleteEdit &>(*ed);
+      const auto *dn = graph.find_node_by_name(de.stage_name);
+      std::string in_name = dn && !dn->inputs.empty() ? graph.get_node(dn->inputs[0])->name : "";
+      prop.apply_delete(de);
+      current = std::get<std::string>(apply_delete_to_source(current, de, in_name));
+    }
+  }
+  return current;
+}
+
+// Applies CSV-input modifies to a copy of the cached CSV collection so B0
+// reruns the edited data, then restores the cache.
+struct CsvPatch {
+  std::string path;
+  Collection original;
+};
+
+static std::vector<CsvPatch> patch_csv_cache(const Graph &graph, const std::string &source_dir,
+                                             const std::vector<const ModifyEdit *> &mods) {
+  std::vector<CsvPatch> patches;
+  auto &cache = GraphExecutor::csv_cache();
+  for (const auto *me : mods) {
+    const auto *n = graph.find_node_by_name(me->input_stage);
+    fs::path p = n->from_file;
+    if (p.is_relative())
+      p = fs::path(source_dir) / p;
+    auto it = cache.find(p.string());
+    if (it == cache.end())
+      continue;
+    bool saved = false;
+    for (const auto &pp : patches)
+      saved = saved || pp.path == p.string();
+    if (!saved)
+      patches.push_back({p.string(), it->second});
+    auto &item = it->second[me->record_id];
+    for (auto &rf : item.value.record_val) {
+      if (rf.name == me->field_name)
+        rf.value = std::make_shared<Value>(me->new_value);
+    }
+  }
+  return patches;
+}
+
+static void restore_csv_cache(std::vector<CsvPatch> &patches) {
+  auto &cache = GraphExecutor::csv_cache();
+  for (auto &p : patches)
+    cache[p.path] = std::move(p.original);
+}
+
+static BenchResultRow benchmark_scenario(const Scenario &sc, const std::string &source_dir) {
+  BenchResultRow row;
+  row.workload = sc.workload;
+  row.edit = sc.edit;
+  row.detail = sc.detail;
+  std::cout << "Benchmarking " << sc.workload << " " << sc.edit << " (" << sc.detail << ")..."
+            << std::endl;
+
+  std::string original_source = read_file(sc.rc_file);
+
+  // 1. Correctness first: propagated result must equal a full rerun
+  VerificationResult v_res = verify_edits(original_source, sc.script, source_dir);
+  row.verify_ok = v_res.ok;
+  if (!v_res.ok) {
+    std::cerr << "VERIFICATION FAILED for " << sc.workload << " " << sc.edit << ": "
+              << v_res.mismatch_details << std::endl;
   }
 
-  // Input CSV file size
-  auto build_res = build_ast_and_ir(src);
-  if (std::holds_alternative<CompileError>(build_res))
-    return;
-  auto [graph, typed] =
-      std::move(std::get<std::pair<Graph, TypedProgram>>(build_res));
+  // 2. B1/B2 start from the same executed graph; only propagation is timed.
+  // Built before the CSV cache is patched for B0, so it sees the original data.
+  Graph base_graph = build_graph(original_source);
+  GraphExecutor base_ex(base_graph, source_dir, true);
+  base_ex.run();
 
-  size_t input_file_bytes = 0;
+  auto run_edits = [&](bool stage_invalidation, RebuildPlan *plan) {
+    Graph g = base_graph.clone();
+    GraphExecutor ex(g, base_ex);
+    Propagator prop(g, ex, stage_invalidation);
+    auto t0 = std::chrono::high_resolution_clock::now();
+    apply_all(prop, sc.script, plan);
+    return elapsed_ms(t0);
+  };
+
+  // 3. B0: full rerun of the edited program from an empty memo
+  std::vector<const ModifyEdit *> csv_mods;
+  std::string b0_source = edited_source(original_source, source_dir, sc.script, csv_mods);
+  Graph b0_template = build_graph(b0_source);
+  auto patches = patch_csv_cache(b0_template, source_dir, csv_mods);
+  auto run_b0 = [&] {
+    Graph g = b0_template.clone();
+    GraphExecutor ex(g, source_dir, false);
+    auto t0 = std::chrono::high_resolution_clock::now();
+    ex.run();
+    return elapsed_ms(t0);
+  };
+
+  RebuildPlan totals;
+  std::vector<std::function<double()>> systems = {run_b0, [&] { return run_edits(false, &totals); }};
+  if (!sc.skip_b1)
+    systems.push_back([&] { return run_edits(true, nullptr); });
+  auto stats = measure_interleaved(systems);
+  restore_csv_cache(patches);
+
+  row.b0 = stats[0];
+  row.b2 = stats[1];
+  if (sc.skip_b1) {
+    row.b1.skipped = true;
+  } else {
+    row.b1 = stats[2];
+  }
+  row.ops_evaluated = totals.recomputed_ops;
+  row.ops_reused = totals.reused_ops;
+  row.full_rerun_ops = totals.full_rerun_ops;
+  size_t ops = totals.recomputed_ops + totals.reused_ops;
+  row.reuse_pct = ops > 0 ? 100.0 * static_cast<double>(totals.reused_ops) / static_cast<double>(ops) : 0.0;
+  return row;
+}
+
+static OverheadRow measure_first_run_overhead(const std::string &workload,
+                                              const std::string &rc_file,
+                                              const std::string &source_dir) {
+  OverheadRow row;
+  row.workload = workload;
+  std::cout << "Measuring first-run overhead for " << workload << "..." << std::endl;
+  Graph graph = build_graph(read_file(rc_file));
+
+  size_t input_bytes = 0;
   for (const auto &[nid, n] : graph.nodes) {
     if (n.kind == NodeKind::INPUT && !n.from_file.empty()) {
       fs::path p = n.from_file;
       if (p.is_relative())
         p = fs::path(source_dir) / p;
-      if (fs::exists(p)) {
-        input_file_bytes += fs::file_size(p);
-      }
+      if (fs::exists(p))
+        input_bytes += fs::file_size(p);
     }
   }
-  row.input_mb = static_cast<double>(input_file_bytes) / (1024.0 * 1024.0);
+  row.input_mb = static_cast<double>(input_bytes) / (1024.0 * 1024.0);
 
-  // Warmup 1
-  for (int i = 0; i < 1; ++i) {
+  auto run = [&](bool memo) {
     Graph g = graph.clone();
-    GraphExecutor ex(g, source_dir, false);
-    ex.run();
-  }
-
-  // Measure Plain (3 runs)
-  std::vector<double> plain_times;
-  for (int i = 0; i < 3; ++i) {
-    Graph g = graph.clone();
-    GraphExecutor ex(g, source_dir, false);
+    GraphExecutor ex(g, source_dir, memo);
     auto t0 = std::chrono::high_resolution_clock::now();
     ex.run();
-    auto t1 = std::chrono::high_resolution_clock::now();
-    plain_times.push_back(
-        std::chrono::duration<double, std::milli>(t1 - t0).count());
-  }
-  row.first_run_plain_ms = compute_stats(plain_times).median_ms;
-
-  // Measure With History/Memo (3 runs)
-  std::vector<double> history_times;
-  size_t memo_bytes = 0;
-  for (int i = 0; i < 3; ++i) {
-    Graph g = graph.clone();
-    GraphExecutor ex(g, source_dir, true);
-    auto t0 = std::chrono::high_resolution_clock::now();
-    ex.run();
-    auto t1 = std::chrono::high_resolution_clock::now();
-    history_times.push_back(
-        std::chrono::duration<double, std::milli>(t1 - t0).count());
-    if (i == 0) {
-      memo_bytes = ex.total_memo_bytes();
-    }
-  }
-  row.first_run_history_ms = compute_stats(history_times).median_ms;
-  row.overhead_pct = ((row.first_run_history_ms - row.first_run_plain_ms) /
-                      row.first_run_plain_ms) *
-                     100.0;
-  row.memo_mb = static_cast<double>(memo_bytes) / (1024.0 * 1024.0);
+    double ms = elapsed_ms(t0);
+    if (memo)
+      row.memo_mb = static_cast<double>(ex.total_memo_bytes()) / (1024.0 * 1024.0);
+    return ms;
+  };
+  row.plain = measure_one([&] { return run(false); });
+  row.history = measure_one([&] { return run(true); });
+  row.overhead_pct = (row.history.median_ms - row.plain.median_ms) / row.plain.median_ms * 100.0;
+  return row;
 }
 
-BenchResultRow benchmark_scenario(const std::string &workload_name,
-                                  const std::string &source_path,
-                                  const std::string &source_dir,
-                                  const std::string &edit_name,
-                                  const EditScript &script) {
-  BenchResultRow row;
-  row.workload = workload_name;
-  row.edit = edit_name;
+// --- Scenario construction --------------------------------------------------
 
-  std::string original_source = read_file(source_path);
+static std::shared_ptr<ModifyEdit> modify_int(const std::string &stage, RecordId id,
+                                              const std::string &field, int64_t v) {
+  auto m = std::make_shared<ModifyEdit>();
+  m->input_stage = stage;
+  m->record_id = id;
+  m->field_name = field;
+  m->new_value = Value::make_int(v);
+  m->raw_literal_text = std::to_string(v);
+  return m;
+}
 
-  // 1. Verify correctness first
-  VerificationResult v_res = verify_edits(original_source, script, source_dir);
-  row.verify_ok = v_res.ok;
-  if (!v_res.ok) {
-    std::cerr << "VERIFICATION FAILED for " << workload_name << " " << edit_name
-              << ": " << v_res.mismatch_details << std::endl;
+static std::shared_ptr<InsertEdit> insert(const std::string &before, const std::string &name,
+                                          const std::string &builtin, const std::string &lambda) {
+  auto ins = std::make_shared<InsertEdit>();
+  ins->before_stage = before;
+  ins->new_stage_name = name;
+  ins->builtin_name = builtin;
+  ins->raw_lambda_text = lambda;
+  return ins;
+}
+
+static std::shared_ptr<DeleteEdit> remove_stage(const std::string &name) {
+  auto del = std::make_shared<DeleteEdit>();
+  del->stage_name = name;
+  return del;
+}
+
+static Scenario one_edit(const std::string &workload, const std::string &rc, const std::string &edit,
+                         const std::string &detail, std::shared_ptr<Edit> e) {
+  Scenario sc{workload, rc, edit, detail, {}, false};
+  sc.script.edits.push_back(std::move(e));
+  return sc;
+}
+
+// E-B: modify 1% of records, spread evenly, capped at kMaxBatch edits because
+// edits apply one at a time and B1 recomputes the whole pipeline per edit.
+static constexpr size_t kMaxBatch = 100;
+
+static Scenario batch_modify(const std::string &workload, const std::string &rc,
+                             const std::string &stage, const std::string &field, size_t n,
+                             int64_t value) {
+  size_t count = std::max<size_t>(1, std::min(n / 100, kMaxBatch));
+  std::ostringstream detail;
+  detail << "modify " << count << " records (" << std::fixed << std::setprecision(2)
+         << (100.0 * static_cast<double>(count) / static_cast<double>(n)) << "%)";
+  Scenario sc{workload, rc, "E-B", detail.str(), {}, false};
+  for (size_t i = 0; i < count; ++i) {
+    sc.script.edits.push_back(modify_int(stage, i * (n / count), field, value));
   }
+  return sc;
+}
 
-  // 2. Prepare rewritten source for B0
-  std::string current_source = original_source;
-  {
-    auto build_res = build_ast_and_ir(original_source);
-    auto [graph, typed] =
-        std::move(std::get<std::pair<Graph, TypedProgram>>(build_res));
-    GraphExecutor ex(graph, source_dir, true);
-    ex.run();
-    Propagator prop(graph, ex);
-    for (const auto &ed : script.edits) {
-      if (ed->kind() == EditKind::MODIFY) {
-        const auto &me = static_cast<const ModifyEdit &>(*ed);
-        const auto *in_n = graph.find_node_by_name(me.input_stage);
-        if (in_n && !in_n->from_file.empty()) {
-          // Handled via CSV rewrite
-        } else {
-          current_source =
-              std::get<std::string>(apply_modify_to_source(current_source, me));
-        }
-      } else if (ed->kind() == EditKind::INSERT) {
-        auto pres = prop.apply_insert(static_cast<const InsertEdit &>(*ed));
-        std::string actual_name =
-            static_cast<const InsertEdit &>(*ed).new_stage_name;
-        if (actual_name.empty()) {
-          for (const auto &sp : std::get<RebuildPlan>(pres).stages) {
-            if (sp.status == StagePlanStatus::NEW)
-              actual_name = sp.stage_name;
-          }
-        }
-        current_source = std::get<std::string>(apply_insert_to_source(
-            current_source, static_cast<const InsertEdit &>(*ed), actual_name));
-      } else if (ed->kind() == EditKind::DELETE) {
-        const auto *dn = graph.find_node_by_name(
-            static_cast<const DeleteEdit &>(*ed).stage_name);
-        std::string in_name = dn && !dn->inputs.empty()
-                                  ? graph.get_node(dn->inputs[0])->name
-                                  : "";
-        prop.apply_delete(static_cast<const DeleteEdit &>(*ed));
-        current_source = std::get<std::string>(apply_delete_to_source(
-            current_source, static_cast<const DeleteEdit &>(*ed), in_name));
-      }
-    }
+static std::vector<Scenario> w1_scenarios(const std::string &data_dir, size_t n,
+                                          const std::string &label) {
+  std::string rc = (fs::path(data_dir) / ("w1_" + std::to_string(n) + ".rc")).string();
+  std::vector<Scenario> s;
+  s.push_back(one_edit(label, rc, "E-A", "modify 1 record", modify_int("raw", 500, "temp", 85)));
+  s.push_back(batch_modify(label, rc, "raw", "temp", n, 75));
+  s.push_back(one_edit(label, rc, "E-C", "insert map near start",
+                       insert("normalized", "shifted", "map", "r => { id: r.id, temp: r.temp + 1 }")));
+  s.push_back(one_edit(label, rc, "E-D", "insert map near end",
+                       insert("total", "bumped", "map", "r => { id: r.id, temp: r.temp + 1 }")));
+  s.push_back(one_edit(label, rc, "E-E", "delete middle stage", remove_stage("scaled")));
+  s.push_back(one_edit(label, rc, "E-F", "insert identity map near start",
+                       insert("normalized", "same", "map", "r => r")));
+  return s;
+}
+
+static std::vector<Scenario> w2_scenarios(const std::string &data_dir, size_t n_orders) {
+  std::string rc = (fs::path(data_dir) / "w2.rc").string();
+  std::vector<Scenario> s;
+  s.push_back(one_edit("W2", rc, "E-A", "modify 1 order", modify_int("orders", 100, "amt", 120)));
+  s.push_back(batch_modify("W2", rc, "orders", "amt", n_orders, 99));
+  s.push_back(one_edit("W2", rc, "E-C", "insert map before join",
+                       insert("joined", "all_active", "map", "u => { uid: u.uid, active: true }")));
+  s.push_back(one_edit("W2", rc, "E-D", "insert map near end",
+                       insert("total_amt", "bumped", "map", "a => a + 1")));
+  s.push_back(one_edit("W2", rc, "E-E", "delete middle stage", remove_stage("filtered")));
+  s.push_back(one_edit("W2", rc, "E-F", "insert identity map",
+                       insert("filtered", "same", "map", "a => a")));
+  return s;
+}
+
+static std::vector<Scenario> w3_scenarios(const std::string &data_dir, size_t n) {
+  std::string rc = (fs::path(data_dir) / "w3.rc").string();
+  std::vector<Scenario> s;
+  s.push_back(one_edit("W3", rc, "E-A", "modify 1 record", modify_int("raw", 500, "val", 50)));
+  s.push_back(batch_modify("W3", rc, "raw", "val", n, 42));
+  s.push_back(one_edit("W3", rc, "E-C", "insert map near start",
+                       insert("s2", "boost", "map", "x => { id: x.id, val: x.val + 1 }")));
+  s.push_back(one_edit("W3", rc, "E-D", "insert map near end",
+                       insert("total", "bumped", "map", "x => { id: x.id, val: x.val + 1 }")));
+  s.push_back(one_edit("W3", rc, "E-E", "delete middle stage", remove_stage("s5")));
+  s.push_back(one_edit("W3", rc, "E-F", "insert identity map near start",
+                       insert("s2", "same", "map", "x => x")));
+  return s;
+}
+
+static std::vector<Scenario> w4_scenarios(const std::string &data_dir, size_t n) {
+  std::string rc = (fs::path(data_dir) / "w4.rc").string();
+  std::vector<Scenario> s;
+  s.push_back(one_edit("W4", rc, "E-A", "modify 1 record", modify_int("raw", n / 2, "val", 999)));
+  s.push_back(batch_modify("W4", rc, "raw", "val", n, 7));
+  s.push_back(one_edit("W4", rc, "E-C", "insert map near start",
+                       insert("mapped", "shifted", "map", "x => { id: x.id, val: x.val + 1 }")));
+  s.push_back(one_edit("W4", rc, "E-D", "insert map near end",
+                       insert("total", "bumped", "map", "x => x + 1")));
+  // E-E: W4 has no deletable middle stage (deleting `mapped` changes the type)
+  s.push_back(one_edit("W4", rc, "E-F", "insert identity map near end",
+                       insert("total", "same", "map", "x => x")));
+  return s;
+}
+
+// --- Output ------------------------------------------------------------------
+
+static std::string fmt_ms(const TimingStats &t) {
+  if (t.skipped)
+    return "skipped";
+  std::ostringstream o;
+  o << std::fixed << std::setprecision(1) << t.median_ms;
+  if (t.runs != kRuns)
+    o << " (n=" << t.runs << ")";
+  return o.str();
+}
+
+static std::string fmt_ratio(const TimingStats &a, const TimingStats &b) {
+  if (a.skipped || b.skipped || b.median_ms <= 0.0)
+    return "-";
+  std::ostringstream o;
+  o << std::fixed << std::setprecision(2) << (a.median_ms / b.median_ms) << "x";
+  return o.str();
+}
+
+static void json_timing(std::ostream &jf, const char *name, const TimingStats &t, bool last) {
+  jf << "      \"" << name << "\": ";
+  if (t.skipped) {
+    jf << "null";
+  } else {
+    jf << "{\"median_ms\": " << t.median_ms << ", \"min_ms\": " << t.min_ms
+       << ", \"max_ms\": " << t.max_ms << ", \"runs\": " << t.runs << "}";
   }
+  jf << (last ? "\n" : ",\n");
+}
 
-  auto b0_build_res = build_ast_and_ir(current_source);
-  auto [b0_graph_template, b0_typed] =
-      std::move(std::get<std::pair<Graph, TypedProgram>>(b0_build_res));
-
-  // Warm-up 1 run for B0
-  for (int i = 0; i < 1; ++i) {
-    Graph g = b0_graph_template.clone();
-    GraphExecutor ex(g, source_dir, false);
-    ex.run();
+static std::string json_escape(const std::string &s) {
+  std::string out;
+  for (char c : s) {
+    if (c == '"' || c == '\\')
+      out += '\\';
+    out += c;
   }
-
-  // Measure B0 (3 runs)
-  std::vector<double> b0_times;
-  for (int i = 0; i < 3; ++i) {
-    Graph g = b0_graph_template.clone();
-    GraphExecutor ex(g, source_dir, false);
-    auto t0 = std::chrono::high_resolution_clock::now();
-    ex.run();
-    auto t1 = std::chrono::high_resolution_clock::now();
-    b0_times.push_back(
-        std::chrono::duration<double, std::milli>(t1 - t0).count());
-  }
-  row.b0_ms = compute_stats(b0_times).median_ms;
-
-  // Prepare baseline pre-executed graph and executor to isolate propagation
-  // timing
-  auto b_res = build_ast_and_ir(original_source);
-  auto [base_graph, base_typed] =
-      std::move(std::get<std::pair<Graph, TypedProgram>>(b_res));
-  GraphExecutor base_ex(base_graph, source_dir, true);
-  base_ex.run();
-
-  auto setup_from_base = [&](bool stage_invalidation) {
-    auto g_ptr = std::make_unique<Graph>(base_graph.clone());
-    auto ex_ptr = std::make_unique<GraphExecutor>(*g_ptr, base_ex);
-    auto prop_ptr =
-        std::make_unique<Propagator>(*g_ptr, *ex_ptr, stage_invalidation);
-    return std::make_tuple(std::move(g_ptr), std::move(ex_ptr),
-                           std::move(prop_ptr));
-  };
-
-  // Warm-up 1 run for B1
-  {
-    auto [g, ex, prop] = setup_from_base(true);
-    for (const auto &ed : script.edits) {
-      if (ed->kind() == EditKind::MODIFY)
-        prop->apply_modify(static_cast<const ModifyEdit &>(*ed));
-      else if (ed->kind() == EditKind::INSERT)
-        prop->apply_insert(static_cast<const InsertEdit &>(*ed));
-      else if (ed->kind() == EditKind::DELETE)
-        prop->apply_delete(static_cast<const DeleteEdit &>(*ed));
-    }
-  }
-
-  // Measure B1 (3 runs)
-  std::vector<double> b1_times;
-  for (int i = 0; i < 3; ++i) {
-    auto [g, ex, prop] = setup_from_base(true);
-    auto t0 = std::chrono::high_resolution_clock::now();
-    for (const auto &ed : script.edits) {
-      if (ed->kind() == EditKind::MODIFY)
-        prop->apply_modify(static_cast<const ModifyEdit &>(*ed));
-      else if (ed->kind() == EditKind::INSERT)
-        prop->apply_insert(static_cast<const InsertEdit &>(*ed));
-      else if (ed->kind() == EditKind::DELETE)
-        prop->apply_delete(static_cast<const DeleteEdit &>(*ed));
-    }
-    auto t1 = std::chrono::high_resolution_clock::now();
-    b1_times.push_back(
-        std::chrono::duration<double, std::milli>(t1 - t0).count());
-  }
-  row.b1_ms = compute_stats(b1_times).median_ms;
-
-  // Warm-up 1 run for B2
-  {
-    auto [g, ex, prop] = setup_from_base(false);
-    for (const auto &ed : script.edits) {
-      if (ed->kind() == EditKind::MODIFY)
-        prop->apply_modify(static_cast<const ModifyEdit &>(*ed));
-      else if (ed->kind() == EditKind::INSERT)
-        prop->apply_insert(static_cast<const InsertEdit &>(*ed));
-      else if (ed->kind() == EditKind::DELETE)
-        prop->apply_delete(static_cast<const DeleteEdit &>(*ed));
-    }
-  }
-
-  // Measure B2 (3 runs)
-  std::vector<double> b2_times;
-  RebuildPlan last_plan;
-  for (int i = 0; i < 3; ++i) {
-    auto [g, ex, prop] = setup_from_base(false);
-    auto t0 = std::chrono::high_resolution_clock::now();
-    for (const auto &ed : script.edits) {
-      std::variant<RebuildPlan, CompileError> pres;
-      if (ed->kind() == EditKind::MODIFY)
-        pres = prop->apply_modify(static_cast<const ModifyEdit &>(*ed));
-      else if (ed->kind() == EditKind::INSERT)
-        pres = prop->apply_insert(static_cast<const InsertEdit &>(*ed));
-      else if (ed->kind() == EditKind::DELETE)
-        pres = prop->apply_delete(static_cast<const DeleteEdit &>(*ed));
-      if (std::holds_alternative<RebuildPlan>(pres)) {
-        last_plan = std::get<RebuildPlan>(pres);
-      }
-    }
-    auto t1 = std::chrono::high_resolution_clock::now();
-    b2_times.push_back(
-        std::chrono::duration<double, std::milli>(t1 - t0).count());
-  }
-  row.b2_ms = compute_stats(b2_times).median_ms;
-  row.speedup_b0_b2 = (row.b2_ms > 0.0001) ? (row.b0_ms / row.b2_ms) : 9999.0;
-  row.speedup_b1_b2 = (row.b2_ms > 0.0001) ? (row.b1_ms / row.b2_ms) : 9999.0;
-  row.reuse_pct = last_plan.reuse_percent;
-  row.ops_evaluated = last_plan.recomputed_ops;
-  row.ops_reused = last_plan.reused_ops;
-
-  return row;
+  return out;
 }
 
 int main(int argc, char **argv) {
   std::string data_dir = "bench/data";
   std::string results_dir = "bench/results";
-  if (argc > 1)
-    data_dir = argv[1];
-  if (argc > 2)
-    results_dir = argv[2];
-
+  std::string machine = "unspecified";
+  std::string only;
+  int cpu = -1;
+  std::vector<std::string> positional;
+  for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--machine" && i + 1 < argc) {
+      machine = argv[++i];
+    } else if (arg == "--cpu" && i + 1 < argc) {
+      cpu = std::stoi(argv[++i]);
+    } else if (arg == "--only" && i + 1 < argc) {
+      only = argv[++i];
+    } else {
+      positional.push_back(arg);
+    }
+  }
+  if (positional.size() > 0)
+    data_dir = positional[0];
+  if (positional.size() > 1)
+    results_dir = positional[1];
   fs::create_directories(results_dir);
+  if (cpu >= 0) {
+#ifdef _WIN32
+    // Hybrid CPUs mix fast and slow cores; letting the OS migrate the runner
+    // between them adds large timing noise.
+    SetProcessAffinityMask(GetCurrentProcess(), DWORD_PTR(1) << cpu);
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+#endif
+    machine += " [pinned to logical CPU " + std::to_string(cpu) + "]";
+  }
 
-  std::cout << "========================================================\n";
-  std::cout << "RetroC Phase 11 Benchmarks\n";
-  std::cout << "Data dir: " << data_dir << "\n";
-  std::cout << "========================================================\n"
-            << std::endl;
+  std::vector<Scenario> scenarios;
+  for (auto &s : w1_scenarios(data_dir, 10000, "W1-10k"))
+    scenarios.push_back(std::move(s));
+  for (auto &s : w1_scenarios(data_dir, 100000, "W1-100k"))
+    scenarios.push_back(std::move(s));
+  for (auto &s : w1_scenarios(data_dir, 1000000, "W1-1M")) {
+    // 100 sequential edits, each a full-pipeline recompute over 1M records
+    // under B1: well over an hour per measurement on this machine.
+    if (s.edit == "E-B")
+      s.skip_b1 = true;
+    scenarios.push_back(std::move(s));
+  }
+  for (auto &s : w2_scenarios(data_dir, 2000))
+    scenarios.push_back(std::move(s));
+  for (auto &s : w3_scenarios(data_dir, 100000))
+    scenarios.push_back(std::move(s));
+  for (auto &s : w4_scenarios(data_dir, 1000000))
+    scenarios.push_back(std::move(s));
 
   std::vector<BenchResultRow> rows;
-
-  // --- Workload W1 (100k records) ---
-  std::string w1_rc = (fs::path(data_dir) / "w1_100000.rc").string();
-
-  // W1, E-A: modify 1 input record
-  {
-    EditScript s;
-    auto m = std::make_shared<ModifyEdit>();
-    m->input_stage = "raw";
-    m->record_id = 500;
-    m->field_name = "temp";
-    m->new_value = Value::make_int(85);
-    s.edits.push_back(std::move(m));
-    std::cout << "Benchmarking W1 E-A (modify 1 record)..." << std::endl;
-    rows.push_back(benchmark_scenario("W1", w1_rc, data_dir, "E-A", s));
+  auto started = std::chrono::high_resolution_clock::now();
+  for (const auto &sc : scenarios) {
+    if (!only.empty() && sc.workload.rfind(only, 0) != 0)
+      continue;
+    rows.push_back(benchmark_scenario(sc, data_dir));
   }
 
-  // W1, E-B: modify input records (batch of 10 records)
-  {
-    EditScript s;
-    for (int i = 0; i < 10; ++i) {
-      auto m = std::make_shared<ModifyEdit>();
-      m->input_stage = "raw";
-      m->record_id = i * 10000;
-      m->field_name = "temp";
-      m->new_value = Value::make_int(75);
-      s.edits.push_back(std::move(m));
-    }
-    std::cout << "Benchmarking W1 E-B (modify batch of records)..." << std::endl;
-    rows.push_back(benchmark_scenario("W1", w1_rc, data_dir, "E-B", s));
+  std::vector<OverheadRow> overheads;
+  if (only.empty() || std::string("W1").rfind(only, 0) == 0) {
+    overheads.push_back(measure_first_run_overhead(
+        "W1-100k", (fs::path(data_dir) / "w1_100000.rc").string(), data_dir));
   }
+  double total_s = elapsed_ms(started) / 1000.0;
 
-  // W1, E-C: insert map near pipeline start (before normalized)
-  {
-    EditScript s;
-    auto ins = std::make_shared<InsertEdit>();
-    ins->before_stage = "normalized";
-    ins->new_stage_name = "shifted";
-    ins->builtin_name = "map";
-    ins->raw_lambda_text = "r => { id: r.id, temp: r.temp + 1 }";
-    s.edits.push_back(std::move(ins));
-    std::cout << "Benchmarking W1 E-C (insert map near start)..." << std::endl;
-    rows.push_back(benchmark_scenario("W1", w1_rc, data_dir, "E-C", s));
-  }
-
-  // W1, E-D: insert map near pipeline end (before total)
-  {
-    EditScript s;
-    auto ins = std::make_shared<InsertEdit>();
-    ins->before_stage = "total";
-    ins->new_stage_name = "capped";
-    ins->builtin_name = "map";
-    ins->raw_lambda_text = "r => { id: r.id, temp: r.temp + 0 }";
-    s.edits.push_back(std::move(ins));
-    std::cout << "Benchmarking W1 E-D (insert map near end)..." << std::endl;
-    rows.push_back(benchmark_scenario("W1", w1_rc, data_dir, "E-D", s));
-  }
-
-  // W1, E-E: delete a middle stage (delete scaled)
-  {
-    EditScript s;
-    auto del = std::make_shared<DeleteEdit>();
-    del->stage_name = "scaled";
-    s.edits.push_back(std::move(del));
-    std::cout << "Benchmarking W1 E-E (delete middle stage)..." << std::endl;
-    rows.push_back(benchmark_scenario("W1", w1_rc, data_dir, "E-E", s));
-  }
-
-  // --- Workload W2 (Join: 50k users, 200k orders) ---
-  std::string w2_rc = (fs::path(data_dir) / "w2.rc").string();
-  {
-    EditScript s;
-    auto m = std::make_shared<ModifyEdit>();
-    m->input_stage = "orders";
-    m->record_id = 100;
-    m->field_name = "amt";
-    m->new_value = Value::make_int(120);
-    s.edits.push_back(std::move(m));
-    std::cout << "Benchmarking W2 E-A (join, modify 1 order)..." << std::endl;
-    rows.push_back(benchmark_scenario("W2", w2_rc, data_dir, "E-A", s));
-  }
-
-  // --- Workload W3 (Deep pipeline: 12 stages, 100k records) ---
-  std::string w3_rc = (fs::path(data_dir) / "w3.rc").string();
-  {
-    EditScript s;
-    auto ins = std::make_shared<InsertEdit>();
-    ins->before_stage = "s2";
-    ins->new_stage_name = "s1_boost";
-    ins->builtin_name = "map";
-    ins->raw_lambda_text = "x => { id: x.id, val: x.val + 1 }";
-    s.edits.push_back(std::move(ins));
-    std::cout << "Benchmarking W3 E-C (deep pipeline, insert near start)..."
-              << std::endl;
-    rows.push_back(benchmark_scenario("W3", w3_rc, data_dir, "E-C", s));
-  }
-
-  // --- Workload W4 (Reduce-heavy: 1M ints) ---
-  std::string w4_rc = (fs::path(data_dir) / "w4.rc").string();
-  {
-    EditScript s;
-    auto m = std::make_shared<ModifyEdit>();
-    m->input_stage = "raw";
-    m->record_id = 50000;
-    m->field_name = "val";
-    m->new_value = Value::make_int(999);
-    s.edits.push_back(std::move(m));
-    std::cout << "Benchmarking W4 E-A (100k records reduce, modify 1)..."
-              << std::endl;
-    rows.push_back(benchmark_scenario("W4", w4_rc, data_dir, "E-A", s));
-  }
-
-  // --- First run overhead measurement for W1 ---
-  std::cout << "Measuring first-run overhead for W1..." << std::endl;
-  OverheadRow w1_overhead;
-  w1_overhead.workload = "W1";
-  run_first_run_overhead(w1_rc, data_dir, w1_overhead);
-
-  // Print Results Table
-  std::cout << "\n============================== BENCHMARK RESULTS "
-               "==============================\n";
-  std::cout << "| Workload | Edit | B0 ms   | B1 ms   | B2 ms   | Speedup "
-               "B0/B2 | Speedup B1/B2 | Reuse % | Verify |\n";
-  std::cout << "|----------|------|---------|---------|---------|--------------"
-               "-|---------------|---------|--------|\n";
+  std::cout << "\nProtocol: " << kWarmup << " warm-up + median of " << kRuns
+            << " timed runs (n=" << kSlowRuns << " after 1 warm-up when a run exceeds "
+            << kSlowRunMs / 1000.0 << " s)\n";
+  std::cout << "Op counts and reuse are summed over all edits of the scenario (B2).\n";
+  std::cout << "| Workload | Edit | Detail | B0 ms | B1 ms | B2 ms | B0/B2 | B1/B2 | "
+               "Recomputed ops | Reused ops | Reuse % | Verify |\n";
+  std::cout << "|---|---|---|---|---|---|---|---|---|---|---|---|\n";
   for (const auto &r : rows) {
-    std::cout << "| " << std::left << std::setw(8) << r.workload << " | "
-              << std::left << std::setw(4) << r.edit << " | " << std::right
-              << std::setw(7) << std::fixed << std::setprecision(2) << r.b0_ms
-              << " | " << std::right << std::setw(7) << std::fixed
-              << std::setprecision(2) << r.b1_ms << " | " << std::right
-              << std::setw(7) << std::fixed << std::setprecision(2) << r.b2_ms
-              << " | " << std::right << std::setw(13) << std::fixed
-              << std::setprecision(2) << r.speedup_b0_b2 << "x"
-              << " | " << std::right << std::setw(13) << std::fixed
-              << std::setprecision(2) << r.speedup_b1_b2 << "x"
-              << " | " << std::right << std::setw(6) << std::fixed
-              << std::setprecision(1) << r.reuse_pct << "%"
-              << " | " << (r.verify_ok ? "PASS  " : "FAIL  ") << " |\n";
+    std::cout << "| " << r.workload << " | " << r.edit << " | " << r.detail << " | "
+              << fmt_ms(r.b0) << " | " << fmt_ms(r.b1) << " | " << fmt_ms(r.b2) << " | "
+              << fmt_ratio(r.b0, r.b2) << " | " << fmt_ratio(r.b1, r.b2) << " | "
+              << r.ops_evaluated << " | " << r.ops_reused << " | " << std::fixed
+              << std::setprecision(1) << r.reuse_pct << "% | "
+              << (r.verify_ok ? "PASS" : "FAIL") << " |\n";
   }
 
-  std::cout << "\n=========================== FIRST-RUN OVERHEAD "
-               "===========================\n";
-  std::cout << "| Workload | First run plain ms | First run with history ms | "
-               "Overhead | Memo MB | Input MB |\n";
-  std::cout << "|----------|--------------------|---------------------------|--"
-               "--------|---------|----------|\n";
-  std::cout << "| " << std::left << std::setw(8) << w1_overhead.workload
-            << " | " << std::right << std::setw(18) << std::fixed
-            << std::setprecision(2) << w1_overhead.first_run_plain_ms << " | "
-            << std::right << std::setw(25) << std::fixed << std::setprecision(2)
-            << w1_overhead.first_run_history_ms << " | " << std::right
-            << std::setw(7) << std::fixed << std::setprecision(1)
-            << w1_overhead.overhead_pct << "%"
-            << " | " << std::right << std::setw(7) << std::fixed
-            << std::setprecision(2) << w1_overhead.memo_mb << " | "
-            << std::right << std::setw(8) << std::fixed << std::setprecision(2)
-            << w1_overhead.input_mb << " |\n";
+  std::cout << "\n| Workload | First run plain ms | First run with history ms | Overhead | "
+               "Memo MB | Input MB |\n";
+  std::cout << "|---|---|---|---|---|---|\n";
+  for (const auto &o : overheads) {
+    std::cout << "| " << o.workload << " | " << fmt_ms(o.plain) << " | " << fmt_ms(o.history)
+              << " | " << std::fixed << std::setprecision(1) << o.overhead_pct << "% | "
+              << std::setprecision(2) << o.memo_mb << " | " << o.input_mb << " |\n";
+  }
+  std::cout << "\nTotal benchmark time: " << std::fixed << std::setprecision(0) << total_s
+            << " s\n";
 
-  // Write JSON file
-  std::string json_path =
-      (fs::path(results_dir) / "benchmark_results.json").string();
+  std::string json_path = (fs::path(results_dir) / "benchmark_results.json").string();
   std::ofstream jf(json_path);
   jf << "{\n";
   jf << "  \"system\": {\n";
-  jf << "    \"cpu\": \"AMD Ryzen 5 5600H with Radeon Graphics (6 cores, 12 "
-        "logical)\",\n";
-  jf << "    \"ram_gb\": 15.4,\n";
-  jf << "    \"os\": \"Microsoft Windows 11 Home Single Language\",\n";
-  jf << "    \"compiler\": \"GCC 15.2.0 (UCRT64)\",\n";
-  jf << "    \"flags\": \"-O2 -Wall -Wextra -Werror\"\n";
+  jf << "    \"machine\": \"" << json_escape(machine) << "\",\n";
+  jf << "    \"compiler\": \"GCC " << __VERSION__ << "\",\n";
+  jf << "    \"flags\": \"-O2 -DNDEBUG\"\n";
   jf << "  },\n";
+  jf << "  \"protocol\": {\"warmup\": " << kWarmup << ", \"runs\": " << kRuns
+     << ", \"slow_run_ms\": " << kSlowRunMs << ", \"slow_runs\": " << kSlowRuns << "},\n";
   jf << "  \"scenarios\": [\n";
   for (size_t i = 0; i < rows.size(); ++i) {
     const auto &r = rows[i];
     jf << "    {\n";
     jf << "      \"workload\": \"" << r.workload << "\",\n";
     jf << "      \"edit\": \"" << r.edit << "\",\n";
-    jf << "      \"b0_ms\": " << r.b0_ms << ",\n";
-    jf << "      \"b1_ms\": " << r.b1_ms << ",\n";
-    jf << "      \"b2_ms\": " << r.b2_ms << ",\n";
-    jf << "      \"speedup_b0_b2\": " << r.speedup_b0_b2 << ",\n";
-    jf << "      \"speedup_b1_b2\": " << r.speedup_b1_b2 << ",\n";
-    jf << "      \"reuse_percent\": " << r.reuse_pct << ",\n";
-    jf << "      \"ops_evaluated\": " << r.ops_evaluated << ",\n";
+    jf << "      \"detail\": \"" << json_escape(r.detail) << "\",\n";
+    json_timing(jf, "b0", r.b0, false);
+    json_timing(jf, "b1", r.b1, false);
+    json_timing(jf, "b2", r.b2, false);
+    jf << "      \"ops_recomputed\": " << r.ops_evaluated << ",\n";
     jf << "      \"ops_reused\": " << r.ops_reused << ",\n";
+    jf << "      \"full_rerun_ops\": " << r.full_rerun_ops << ",\n";
+    jf << "      \"reuse_percent\": " << r.reuse_pct << ",\n";
     jf << "      \"verify_ok\": " << (r.verify_ok ? "true" : "false") << "\n";
     jf << "    }" << (i + 1 < rows.size() ? "," : "") << "\n";
   }
   jf << "  ],\n";
-  jf << "  \"first_run_overhead\": {\n";
-  jf << "    \"workload\": \"" << w1_overhead.workload << "\",\n";
-  jf << "    \"plain_ms\": " << w1_overhead.first_run_plain_ms << ",\n";
-  jf << "    \"with_history_ms\": " << w1_overhead.first_run_history_ms
-     << ",\n";
-  jf << "    \"overhead_percent\": " << w1_overhead.overhead_pct << ",\n";
-  jf << "    \"memo_mb\": " << w1_overhead.memo_mb << ",\n";
-  jf << "    \"input_mb\": " << w1_overhead.input_mb << "\n";
-  jf << "  }\n";
+  jf << "  \"first_run_overhead\": [\n";
+  for (size_t i = 0; i < overheads.size(); ++i) {
+    const auto &o = overheads[i];
+    jf << "    {\n";
+    jf << "      \"workload\": \"" << o.workload << "\",\n";
+    json_timing(jf, "plain", o.plain, false);
+    json_timing(jf, "with_history", o.history, false);
+    jf << "      \"overhead_percent\": " << o.overhead_pct << ",\n";
+    jf << "      \"memo_mb\": " << o.memo_mb << ",\n";
+    jf << "      \"input_mb\": " << o.input_mb << "\n";
+    jf << "    }" << (i + 1 < overheads.size() ? "," : "") << "\n";
+  }
+  jf << "  ]\n";
   jf << "}\n";
-
-  std::cout << "\nResults saved to: " << json_path << std::endl;
+  std::cout << "Results saved to: " << json_path << std::endl;
   return 0;
 }
